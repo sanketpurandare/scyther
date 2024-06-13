@@ -1,13 +1,14 @@
 import copy
 from contextlib import nullcontext
+from typing import cast
 
 import torch
-from torch.distributed._tools.mem_tracker import MemTracker
+from torch.distributed._tools.mem_tracker import MemTracker, _ModState, _ModMemStats, _MemRefType
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from test_model import GPT, GPTConfig
 
-def collect_mem_stats():
+def collect_mem_stats(print_stats: bool = False):
     dev = torch.device(torch.cuda.current_device())
     n_layer = 6
     vocab_size = 8192
@@ -48,8 +49,18 @@ def collect_mem_stats():
     print(f"Tracker Max: {tracker_max}, CUDA Max: {cuda_max}, Accuracy: {accuracy}")
     print(accuracy >= 0.9)
     module_mem_stats = copy.deepcopy(mt.memory_tracking)
+    if print_stats:
+        for mod in model.modules():
+            mod_stat = module_mem_stats.get(mod, None)
+            if mod_stat:
+                mod_stat = cast(_ModMemStats, mod_stat)
+                print(mod_stat.mod_fqn)
+                # Access using state, #call, device, type
+                print(f"Fw Peak Activation: {mod_stat.snapshots[_ModState.PEAK_FW][-1][dev][_MemRefType.ACT]}")
+                print(f"Bw Peak Activation: {mod_stat.snapshots[_ModState.PEAK_BW][-1][dev][_MemRefType.ACT]}")
+                print(f"Bw Peak Temp (Act Grads): {mod_stat.snapshots[_ModState.PEAK_BW][-1][dev][_MemRefType.TEMP]}")
 
 if __name__ == "__main__":
     use_fake_mode = False
     with FakeTensorMode() if use_fake_mode else nullcontext():
-        collect_mem_stats()
+        collect_mem_stats(print_stats=True)
