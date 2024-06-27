@@ -1,7 +1,8 @@
-import torch
-import torch.nn as nn
 from dataclasses import dataclass
 from typing import List, Tuple
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 # NOTE: We take the GPT2 implementation from nanoGPT: https://github.com/karpathy/nanoGPT
@@ -11,9 +12,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(
-            config.n_embd, 3 * config.n_embd, bias=config.bias
-        )
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -43,13 +42,9 @@ class CausalSelfAttention(nn.Module):
 class GPTMLP(nn.Module):  # renamed to avoid name conflict
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(
-            config.n_embd, 4 * config.n_embd, bias=config.bias
-        )
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(
-            4 * config.n_embd, config.n_embd, bias=config.bias
-        )
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -119,7 +114,8 @@ class GPT(nn.Module):
         self.lm_head.weight = self.transformer.wte.weight
 
     def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor
+        self,
+        idx: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = idx.device
         b, t = idx.size()
@@ -133,14 +129,15 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if self.config.checkpoint_activations:
                 # We only support composition with non-reentrant AC
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, use_reentrant=False
-                )
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-        )
-        return loss
+        return logits
+
+
+def loss_fn(logits: torch.Tensor, targets: torch.Tensor):
+    return F.cross_entropy(
+        logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+    )
