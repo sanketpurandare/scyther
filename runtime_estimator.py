@@ -83,6 +83,8 @@ class EstimateMode(TorchDispatchMode):
         )
         self.mod_fw_pre_order = []
         self.mod_bw_pre_order = []
+        self.mod_fw_post_order = []
+        self.mod_bw_post_order = []
         self.total_runtime: float = 0.0
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py#L1838
@@ -309,11 +311,19 @@ class EstimateMode(TorchDispatchMode):
         self.mod_runtimes = defaultdict(lambda: defaultdict(lambda: 0.0))
         self.mod_fw_pre_order.clear()
         self.mod_bw_pre_order.clear()
+        self.mod_fw_post_order.clear()
+        self.mod_bw_post_order.clear()
         self._mod_tracker.register_user_hooks(
             pre_fw_hook=lambda mod, inp: self.mod_fw_pre_order.append(
                 self._mod_tracker.get_known_fqn(mod)
             ),
             pre_bw_hook=lambda mod, g_out: self.mod_bw_pre_order.append(
+                self._mod_tracker.get_known_fqn(mod)
+            ),
+            post_fw_hook=lambda mod, inp, out: self.mod_fw_post_order.append(
+                self._mod_tracker.get_known_fqn(mod)
+            ),
+            post_bw_hook=lambda mod, g_inp: self.mod_bw_post_order.append(
                 self._mod_tracker.get_known_fqn(mod)
             ),
         )
