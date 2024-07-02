@@ -94,7 +94,7 @@ def aggregate_stats(
                         _MemRefType.TEMP
                     ]
                 ),
-                "act_total": mod_mem_stat.snapshots[_ModState.PRE_FW][-1][dev][
+                "act_total": mod_mem_stat.snapshots[_ModState.POST_FW][-1][dev][
                     _MemRefType.ACT
                 ],
                 "input_per_module": mod_mem_stat.input_mem,
