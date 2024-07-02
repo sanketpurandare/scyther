@@ -25,7 +25,7 @@ logger.addHandler(handler)
 
 class Node(ModStats):
     # per module activation size, excluding children's activations
-    act_excl: int = 0
+    pos_fw_post_order: int = 0  # index according to post-order
 
 
 class Graph:
@@ -59,6 +59,7 @@ def parse_input(filename: str) -> Graph:
     )
     for mod_info in module_info["modstats"]:
         node: Node = mod_info
+        node["pos_fw_post_order"] = module_info["fw_post_order"].index(node["fqn"])
         g.add_node(node)
 
     # set up ancestor-descendant matrix
@@ -75,19 +76,10 @@ def parse_input(filename: str) -> Graph:
             else:
                 break
 
-    # get per-module intermediate activations exclusive for the module
-    # (i.e., removing children’s intermediate activations)
-    for i in range(n_nodes - 1, -1, -1):
-        g.nodes[i]["act_excl"] = g.nodes[i]["act_fw_per_module"] - sum(
-            g.nodes[j]["act_excl"]
-            for j in range(i + 1, n_nodes)
-            if g.ad_matrix[i][j] == 1
-        )
-
     return g
 
 
-def fsdp_milp(g: Graph, verbose: bool = False) -> OptimizeResult:
+def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     """
     MILP to decide FSDP & AC units with the goal of minimizing peak memory consumption.
 
@@ -105,10 +97,8 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> OptimizeResult:
     * K is the penalty constant (in unit of bytes) for large number of FSDP units
       - e.g., if K=2**30, it is worth to save 1GB with 1 additional FSDP unit
     * M is a large number
-    * TA_i is the total activation up to but excluding the current module
+    * TA_i is the total activation up to and including the current module
     * IA_i is the per-module intermediate activations
-    * IAe_i is the per-module intermediate activations exclusive for the module
-      - i.e., removing children’s intermediate activations
     * AG_i is the per-module activation gradients
     * R is the amount of intermediate activations to be discarded is a module is an AC unit
 
@@ -147,7 +137,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> OptimizeResult:
     y_i + y_j                                <= 1      forall i,j where i<>j and AD[i,j]=1
 
     # constraint 6 -- to express a_i
-    a_i + sum_{j: j<i, AD[j,i]=0} R*IA_j*y_i =  TA_i + AG_i + IAe_i     forall i in [n]
+    a_i + sum_{j: j before i in fw_post_order} R*IA_j*y_i =  TA_i + AG_i     forall i in [n]
     ```
 
     ## Bounds and Integrality
@@ -168,7 +158,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> OptimizeResult:
     K = 25 * 2**20  # number of bytes in 20MB  #TODO not hard code, maybe P_1/W?
     M = 100 * 2**30  # number of bytes in 100GB
     SCIPY_TIME_LIMIT_SEC = 30000
-    r = 0.8  # memory_budget #TODO per-module budget
+    r = 0.6  # memory_budget #TODO per-module budget
 
     # variables
     # x_1, ..., x_n, w_1, ..., w_n, m_1, ..., m_n, a_1, ..., a_n, y_0, ..., y_n,
@@ -271,17 +261,15 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> OptimizeResult:
     # constraints 6:
     # total activation (grad) memory in the backward pass
     for i in range(num_nodes):
-        IAe_i = g.nodes[i]["act_excl"]
         AG_i = g.nodes[i]["act_grad_per_module"]
         TA_i = g.nodes[i]["act_total"]
         A = np.zeros(num_vars)
         A[_a_var(i)] = 1
-        for j in range(i):
-            if g.ad_matrix[j][i] == 1:
-                continue
-            IA_j = g.nodes[j]["act_fw_per_module"]
-            A[_y_var(j)] = IA_j * r
-        RHS = TA_i + AG_i + IAe_i
+        for j in range(num_nodes):
+            if g.nodes[j]["pos_fw_post_order"] < g.nodes[i]["pos_fw_post_order"]:
+                IA_j = g.nodes[j]["act_fw_per_module"]
+                A[_y_var(j)] = IA_j * r
+        RHS = TA_i + AG_i
         constraints.append(LinearConstraint(A=A, lb=RHS, ub=RHS))
 
     # Bounds
