@@ -41,6 +41,8 @@ def collect_runtime_stats(
         copy.deepcopy(estimate_mode.mod_runtimes),
         copy.deepcopy(estimate_mode.mod_fw_pre_order),
         copy.deepcopy(estimate_mode.mod_bw_pre_order),
+        copy.deepcopy(estimate_mode.mod_fw_post_order),
+        copy.deepcopy(estimate_mode.mod_bw_post_order),
     )
 
 

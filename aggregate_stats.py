@@ -52,12 +52,18 @@ def aggregate_stats(
     export_to_json: bool = False,
 ):
     mod_mem_stats = collect_mem_stats(model, optimizer, inp_and_target, loss_fn)
-    mod_runtime_stats, fw_pre_order, bw_pre_order = collect_runtime_stats(
-        model, optimizer, inp_and_target, loss_fn
-    )
+    (
+        mod_runtime_stats,
+        fw_pre_order,
+        bw_pre_order,
+        fw_post_order,
+        bw_post_order,
+    ) = collect_runtime_stats(model, optimizer, inp_and_target, loss_fn)
     module_info: ModuleInfo = {
         "fw_pre_order": fw_pre_order,
         "bw_pre_order": bw_pre_order,
+        "fw_post_order": fw_post_order,
+        "bw_post_order": bw_post_order,
         "modstats": [],
     }
 
