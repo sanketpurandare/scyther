@@ -81,7 +81,7 @@ def parse_input(filename: str) -> Graph:
     return g
 
 
-def fsdp_milp(g: Graph, verbose: bool = False) -> None:
+def fsdp_milp(g: Graph, selective_ac: bool = False, verbose: bool = False) -> None:
     """
     MILP to decide FSDP & AC units with the goal of minimizing peak memory consumption.
     #TODO: link doc with formulation
@@ -89,8 +89,8 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
 
     # Parameters
     world_size = 8
-    K = 25 * 2**20  # number of bytes in 20MB  #TODO not hard code, maybe P_1/W?
-    M = 100 * 2**30  # number of bytes in 100GB
+    K = 25 * 2**20  # number of bytes in 25 MiB  #TODO not hard code, maybe P_1/W?
+    M = 100 * 2**30  # number of bytes in 100 GiB
     SCIPY_TIME_LIMIT_SEC = 30000
     r = 0.6  # memory_budget #TODO per-module budget
 
@@ -216,6 +216,13 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
                 A[_y_var(i)] = 1
                 A[_y_var(j)] = 1
                 constraints.append(LinearConstraint(A=A, ub=1))
+
+    # [Constraint] No AC if SAC is set to be false:
+    if not selective_ac:
+        for i in range(num_nodes):
+            A = np.zeros(num_vars)
+            A[_y_var(i)] = 1
+            constraints.append(LinearConstraint(A=A, lb=0, ub=0))
 
     # [Constraint] No nested FSDP units
     for i in range(1, num_nodes):
@@ -344,4 +351,4 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
 if __name__ == "__main__":
     # get the json file by running `python aggregate_stats.py`
     g = parse_input("GPT_modules_info.json")
-    result = fsdp_milp(g, verbose=True)
+    result = fsdp_milp(g, selective_ac=True, verbose=True)
