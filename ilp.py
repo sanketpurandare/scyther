@@ -7,7 +7,6 @@ import numpy as np
 from aggregate_stats import ModStats
 
 from scipy.optimize import Bounds, LinearConstraint, milp
-from scipy.optimize._optimize import OptimizeResult
 
 # Create a logger object
 logger = logging.getLogger(__name__)
@@ -24,8 +23,8 @@ logger.addHandler(handler)
 
 
 class Node(ModStats):
-    # per module activation size, excluding children's activations
-    pos_fw_post_order: int = 0  # index according to post-order
+    index: int = 0  # index according to forward pre-order
+    pos_fw_post_order: int = 0  # index according to forward post-order
 
 
 class Graph:
@@ -34,6 +33,7 @@ class Graph:
         self.nodes: List[Node] = []
         self.name2node: Dict[str, Node] = {}
         self.ad_matrix = np.zeros((n, n))
+        self.fw_post_order: List[str] = []
 
     def add_node(self, node: Node) -> None:
         self.nodes.append(node)
@@ -51,15 +51,17 @@ def parse_input(filename: str) -> Graph:
     # create graph
     model_name = filename.split("_")[0]
     g = Graph(model_name, n_nodes)
+    g.fw_post_order = module_info["fw_post_order"]
 
     # sort the modules by pre-order and add them to the graph
     module_info["modstats"] = sorted(
         module_info["modstats"],
         key=lambda x: module_info["fw_pre_order"].index(x["fqn"]),
     )
-    for mod_info in module_info["modstats"]:
+    for i, mod_info in enumerate(module_info["modstats"]):
         node: Node = mod_info
-        node["pos_fw_post_order"] = module_info["fw_post_order"].index(node["fqn"])
+        node["index"] = i
+        node["pos_fw_post_order"] = g.fw_post_order.index(node["fqn"])
         g.add_node(node)
 
     # set up ancestor-descendant matrix
@@ -98,7 +100,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
 
     def _x_var(i: int) -> int:
         return i
-    
+
     def _p_var(i: int) -> int:
         return num_nodes + i
 
@@ -230,10 +232,11 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
         TA_i = g.nodes[i]["act_total"]
         A = np.zeros(num_vars)
         A[_a_var(i)] = 1
-        for j in range(num_nodes):
-            if g.nodes[j]["pos_fw_post_order"] < g.nodes[i]["pos_fw_post_order"]:
-                IA_j = g.nodes[j]["act_fw_per_module"]
-                A[_y_var(j)] = IA_j * r
+        pos = g.nodes[i]["pos_fw_post_order"]
+        for p in range(pos):
+            j = g.name2node[g.fw_post_order[p]]["index"]
+            IA_j = g.nodes[j]["act_fw_per_module"]
+            A[_y_var(j)] = IA_j * r
         RHS = TA_i + AG_i
         constraints.append(LinearConstraint(A=A, lb=RHS, ub=RHS))
 
