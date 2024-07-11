@@ -82,75 +82,7 @@ def parse_input(filename: str) -> Graph:
 def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     """
     MILP to decide FSDP & AC units with the goal of minimizing peak memory consumption.
-
-    ## Notations
-    * N={v_1,v_2,...,v_n} is the set of nodes (or modules)
-    * AD is a matrix representation of Ancestor-Descendant relationships
-        - AD_{i,j}=1 if v_i is an ancestor/supmodule (self included) of v_j
-
-    ## Parameters
-    * P_i is the per-module unsharded parameter memory of module v_i
-    * G_i is the per-module unsharded gradient memory of module v_i
-    * T_i = P_i + G_i
-    * TG_i is the total unsharded gradient memory post module v_i in the backward pass
-    * W is the world size
-    * K is the penalty constant (in unit of bytes) for large number of FSDP units
-      - e.g., if K=2**30, it is worth to save 1GB with 1 additional FSDP unit
-    * M is a large number
-    * TA_i is the total activation up to and including the current module
-    * IA_i is the per-module intermediate activations
-    * AG_i is the per-module activation gradients
-    * R is the amount of intermediate activations to be discarded is a module is an AC unit
-
-    ## Decision Variables
-    * x_i is the binary indicator variable for whether module v_i is an FSDP unit
-    * w_i is the unsharded parameter+gradient memory communicated at module v_i
-    * m_i is the total memory during the backward pass at module v_i.
-    * a_i is the activation memory during the backward pass at module v_i
-    * y_i is the binary decision variable indicating if SAC policy is applied to module v_i
-    * peak_mem is the peak memory
-    * max_w is the maximum unsharded parameter+gradient memory of all FSDP units
-
-    ## Objective
-    ```
-    minimize 	peak_mem + max_w + K sum_i x_i + sum_i y_i
-    ```
-
-    ## Constraints
-    ```
-    # constraint 1 -- to express w_i
-    M x_i - w_i                              >= 0      forall i in [n]
-    sum_{j: AD[i,j]==1} w_j - T_i * x_i      >= 0      forall i in [n]
-    sum_{j: AD[i,j]==1} w_j                  <= T_i    forall i in [n]
-
-    # constraint 2 -- to express m_i
-    m_i - sum_{j: AD[j,i]==1} w_j - a_i      =  P_1/W + TG_i/W   forall i in [n]
-
-    # constraint 3 -- to express peak_mem
-    peak_mem - m_i                           >= 0      forall i in [n]
-
-    # constraint 4 -- to express max_w
-    max_w - w_i                              >= 0      forall i in [n]
-
-    # constraint 5 -- to ensure composibility and compatibility
-    y_i + x_j                                <= 1      forall i,j where i<>j and AD[i,j]=1
-    y_i + y_j                                <= 1      forall i,j where i<>j and AD[i,j]=1
-
-    # constraint 6 -- to express a_i
-    a_i + sum_{j: j before i in fw_post_order} R*IA_j*y_i =  TA_i + AG_i     forall i in [n]
-    ```
-
-    ## Bounds and Integrality
-    ```
-    x_1      =  1
-    x_i      in {0, 1}   forall i in [n]
-    w_i      >= 0        forall i in [n]
-    m_i      >= 0        forall i in [n]
-    a_i      >= 0        forall i in [n]
-    y_i      in {0,1}    forall i in [n]
-    peak_mem >= 0
-    max_w    >= 0
-    ```
+    #TODO: link doc with formulation
     """
 
     # Parameters
@@ -160,23 +92,27 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     SCIPY_TIME_LIMIT_SEC = 30000
     r = 0.6  # memory_budget #TODO per-module budget
 
-    # variables
-    # x_1, ..., x_n, w_1, ..., w_n, m_1, ..., m_n, a_1, ..., a_n, y_0, ..., y_n,
-    # peak_mem, max_w
+    # Decision Variables
     num_nodes = len(g.nodes)
-    num_vars = num_nodes * 5 + 2
+    num_vars = num_nodes * 6 + 2
 
-    def _w_var(i: int) -> int:
+    def _x_var(i: int) -> int:
+        return i
+    
+    def _p_var(i: int) -> int:
         return num_nodes + i
 
-    def _m_var(i: int) -> int:
+    def _g_var(i: int) -> int:
         return num_nodes * 2 + i
 
-    def _a_var(i: int) -> int:
+    def _m_var(i: int) -> int:
         return num_nodes * 3 + i
 
-    def _y_var(i: int) -> int:
+    def _a_var(i: int) -> int:
         return num_nodes * 4 + i
+
+    def _y_var(i: int) -> int:
+        return num_nodes * 5 + i
 
     def _peak_mem_var() -> int:
         return -2
@@ -187,31 +123,51 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     # Define constraints for the optimization.
     constraints = []
 
-    # constraints 1:
-    # specify the amount of parameter / gradient taken care of by each module for FSDP
+    # [Constraint] specify the amount of parameter taken care of by each module for FSDP
     for i in range(num_nodes):
-        T_i = g.nodes[i]["param_per_module"] + g.nodes[i]["grad_per_module"]
-        # if not FSDP unit, then taking care of zero parameters and gradients
+        P_i = g.nodes[i]["param_per_module"] + g.nodes[i]["grad_per_module"]
+        # if not FSDP unit, then taking care of zero parameters
         A1 = np.zeros(num_vars)
         A1[i] = M
-        A1[_w_var(i)] = -1
+        A1[_p_var(i)] = -1
         constraints.append(LinearConstraint(A=A1, lb=0))
-        # if FSDP unit, total taken care of by subtree is >= total parameter + gradients
+        # if FSDP unit, total taken care of by subtree is >= total parameter
         A2 = np.zeros(num_vars)
-        A2[i] = -T_i
+        A2[i] = -P_i
         for j in range(num_nodes):
             if g.ad_matrix[i][j] == 1:
-                A2[_w_var(j)] = 1
+                A2[_p_var(j)] = 1
         constraints.append(LinearConstraint(A=A2, lb=0))
-        # total taken care of by subtree is <= total parameter + gradients
+        # total taken care of by subtree is <= total parameter
         A3 = np.zeros(num_vars)
         for j in range(num_nodes):
             if g.ad_matrix[i][j] == 1:
-                A3[_w_var(j)] = 1
-        constraints.append(LinearConstraint(A=A3, ub=T_i))
+                A3[_p_var(j)] = 1
+        constraints.append(LinearConstraint(A=A3, ub=P_i))
 
-    # constraints 2:
-    # specify the amount memory (activation + params & grads) at each module
+    # [Constraint] specify the amount of gradients taken care of by each module for FSDP
+    for i in range(num_nodes):
+        G_i = g.nodes[i]["grad_per_module"]
+        # if not FSDP unit, then taking care of zero gradients
+        A1 = np.zeros(num_vars)
+        A1[i] = M
+        A1[_g_var(i)] = -1
+        constraints.append(LinearConstraint(A=A1, lb=0))
+        # if FSDP unit, total taken care of by subtree is >= total gradients
+        A2 = np.zeros(num_vars)
+        A2[i] = -G_i
+        for j in range(num_nodes):
+            if g.ad_matrix[i][j] == 1:
+                A2[_g_var(j)] = 1
+        constraints.append(LinearConstraint(A=A2, lb=0))
+        # total taken care of by subtree is <= total gradients
+        A3 = np.zeros(num_vars)
+        for j in range(num_nodes):
+            if g.ad_matrix[i][j] == 1:
+                A3[_g_var(j)] = 1
+        constraints.append(LinearConstraint(A=A3, ub=G_i))
+
+    # [Constraint] specify the amount memory (activation + params & grads) at each module
     P_1 = g.nodes[0]["param_per_module"]
     for i in range(num_nodes):
         TG_i = g.nodes[i]["grad_total"]
@@ -221,45 +177,54 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
         A[_a_var(i)] = -1
         for j in range(num_nodes):
             if g.ad_matrix[j][i] == 1:
-                A[_w_var(j)] = -1
+                A[_p_var(j)] = -1
+                A[_g_var(j)] = -1
         constraints.append(LinearConstraint(A=A, lb=RHS, ub=RHS))
 
-    # constraints 3:
-    # peak memory
+    # [Constraint] peak memory
     for i in range(num_nodes):
         A = np.zeros(num_vars)
         A[_peak_mem_var()] = 1
         A[_m_var(i)] = -1
         constraints.append(LinearConstraint(A=A, lb=0))
 
-    # constraints 4:
-    # maximum sharded params+grads among all FSDP units
+    # [Constraint] maximum sharded params+grads among all FSDP units
     for i in range(num_nodes):
         A = np.zeros(num_vars)
         A[_max_w_var()] = 1
-        A[_w_var(i)] = -1
+        A[_p_var(i)] = -1
+        A[_g_var(i)] = -1
         constraints.append(LinearConstraint(A=A, lb=0))
 
-    # constraints 5:
-    # ensure composibility / compatibility of AC and FSDP units
+    # [Constraint] ensure composibility of AC and FSDP units
+    # AC units need to be within FSDP boundary
     for i in range(num_nodes):
-        # AC units need to be within FSDP boundary
         for j in range(i + 1, num_nodes):
             if g.ad_matrix[i][j] == 1:
-                A1 = np.zeros(num_vars)
-                A1[_y_var(i)] = 1
-                A1[j] = 1
-                constraints.append(LinearConstraint(A=A1, ub=1))
-        # No nested AC units
-        for j in range(i + 1, num_nodes):
-            if g.ad_matrix[i][j] == 1:
-                A2 = np.zeros(num_vars)
-                A2[_y_var(i)] = 1
-                A2[_y_var(j)] = 1
-                constraints.append(LinearConstraint(A=A2, ub=1))
+                A = np.zeros(num_vars)
+                A[_y_var(i)] = 1
+                A[j] = 1
+                constraints.append(LinearConstraint(A=A, ub=1))
 
-    # constraints 6:
-    # total activation (grad) memory in the backward pass
+    # [Constraint] No nested AC units
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            if g.ad_matrix[i][j] == 1:
+                A = np.zeros(num_vars)
+                A[_y_var(i)] = 1
+                A[_y_var(j)] = 1
+                constraints.append(LinearConstraint(A=A, ub=1))
+
+    # [Constraint] No nested FSDP units
+    for i in range(1, num_nodes):
+        for j in range(i + 1, num_nodes):
+            if g.ad_matrix[i][j] == 1:
+                A = np.zeros(num_vars)
+                A[_x_var(i)] = 1
+                A[_x_var(j)] = 1
+                constraints.append(LinearConstraint(A=A, ub=1))
+
+    # [Constraint] total activation (grad) memory in the backward pass
     for i in range(num_nodes):
         AG_i = g.nodes[i]["act_grad_per_module"]
         TA_i = g.nodes[i]["act_total"]
@@ -277,7 +242,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     ub = np.concatenate(
         [
             np.ones(num_nodes),  # x_i
-            np.full((num_nodes * 3,), np.inf),  # w_i, m_i, and a_i
+            np.full((num_nodes * 4,), np.inf),  # p_i, g_i, m_i, and a_i
             np.ones(num_nodes),  # y_i
             np.full((2,), np.inf),  # peak_mem and max_w
         ]
@@ -288,7 +253,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     integrality = np.concatenate(
         [
             np.ones(num_nodes),  # x_i
-            np.zeros(num_nodes * 3),  # w_i, m_i, and a_i
+            np.zeros(num_nodes * 4),  # p_i, g_i, m_i, and a_i
             np.ones(num_nodes),  # y_i
             np.zeros(2),  # peak_mem and max_w
         ]
@@ -298,7 +263,7 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
     c = np.concatenate(
         [
             np.full((num_nodes,), K),
-            np.zeros(num_nodes * 3),  # w_i, m_i, and a_i
+            np.zeros(num_nodes * 4),  # p_i, g_i, m_i, and a_i
             np.ones(num_nodes),  # y_i
             np.ones(2),  # peak_mem, max_w
         ]
@@ -359,7 +324,8 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
         y_i = round(result.x[_y_var(i)])
         a_i = result.x[_a_var(i)]
         m_i = result.x[_m_var(i)]
-        w_i = abs(result.x[_w_var(i)])
+        p_i = abs(result.x[_p_var(i)])
+        g_i = abs(result.x[_g_var(i)])
         logger.info(
             ("FSDP" if x_i == 1 else "    ")
             + " "
@@ -367,7 +333,8 @@ def fsdp_milp(g: Graph, verbose: bool = False) -> None:
             + f" {g.nodes[i]['fqn']:<40}: "
             + f"a_i = {display_bytes(a_i, 'GiB'):<10} "
             + f"m_i = {display_bytes(m_i, 'GiB'):<10} "
-            + f"w_i = {display_bytes(w_i, 'GiB'):<10} "
+            + f"p_i = {display_bytes(p_i, 'GiB'):<10} "
+            + f"g_i = {display_bytes(g_i, 'GiB'):<10} "
         )
 
 
