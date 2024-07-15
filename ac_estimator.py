@@ -4,11 +4,11 @@ import sys
 import warnings
 from collections import OrderedDict
 from dataclasses import astuple, dataclass
-from typing import Any, Dict, List, NamedTuple, Set, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 from runtime_estimator import RuntimeEstimator
-from torch import nn, UntypedStorage
+from torch import nan, nn, UntypedStorage
 from torch._guards import active_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed._tools.mod_tracker import ModTracker
@@ -94,10 +94,9 @@ class ACStats:
     force_store_random: bool
 
 
-class _MSPS(NamedTuple):
+class MSPS(NamedTuple):
     func_names: Set[str]
     op_idx: int
-    op_group: Union[Set[int], None]
     memory: int
     runtime: float
     msps: float
@@ -124,10 +123,19 @@ class ACTradeOffStats:
     ac_runtime: float
 
 
+@dataclass
+class GreedyOrderMeta:
+    recomputed_ops: Set[int]
+    stored_ops: Set[int]
+    inplace_op_groups: Dict[int, Set[int]]
+    msps_meta: List[MSPS]
+
+
 class SACEstimator(TorchDispatchMode):
     def __init__(self):
         self.ac_mod_stats: Dict[str, ACStats] = {}
         self.ac_mod_tradeoff_stats: Dict[str, ACTradeOffStats] = {}
+        self.ac_mod_greedy_order_meta: Dict[str, GreedyOrderMeta] = {}
         self._mod_tracker = ModTracker()
         self._ac_metadata: List[_ACMetadata] = []
         self._ac_mod_metadata: Dict[str, _ACModMetadata] = {}
@@ -156,6 +164,9 @@ class SACEstimator(TorchDispatchMode):
             self.ac_mod_stats[mod_fqn] = self._get_ac_stats(
                 data=self._ac_mod_metadata[mod_fqn].ac_metadata,
                 force_store_random=self._ac_mod_metadata[mod_fqn].force_store_random,
+            )
+            self.ac_mod_greedy_order_meta[mod_fqn] = self._get_greedy_order_meta(
+                self.ac_mod_stats[mod_fqn]
             )
 
     def _get_force_store_random(self, inputs: Any) -> bool:
@@ -319,18 +330,7 @@ class SACEstimator(TorchDispatchMode):
 
         return out
 
-    def _get_sac_policy(self, ac_stats: ACStats, memory_budget: float, alg: str):
-        pass
-
-    def _get_ilp_policy(self, ac_stats: ACStats, memory_budget: float):
-        pass
-
-    def _get_greedy_policy(self, ac_stats: ACStats, memory_budget: float):
-        pass
-
-    def _get_greedy_order(
-        self, ac_stats: ACStats
-    ) -> Tuple[Set[int], Set[int], List[_MSPS]]:
+    def _get_greedy_order_meta(self, ac_stats: ACStats) -> GreedyOrderMeta:
         # An inplace-op group is a set of inplace-ops that operate on the same underlying tensor storage.
         # 1. inplace_op_groups: A dictionary from the top-most parent of inplace-ops to the inplace-ops in the group
         #   The top-most op can itself be an inplace-op or can be a non-inplace op.
@@ -386,7 +386,7 @@ class SACEstimator(TorchDispatchMode):
                 recompute_candidates.add(op_idx)
 
         # We define msps for a recomp candidate as the ratio of memory/runtime aka memory savings per second
-        msps_meta: List[_MSPS] = []
+        msps_meta: List[MSPS] = []
         for cand in recompute_candidates:
             if cand in inplace_op_groups:
                 mem = sum(
@@ -398,21 +398,20 @@ class SACEstimator(TorchDispatchMode):
                 func_names = {
                     ac_stats.func_names[op_idx] for op_idx in inplace_op_groups[cand]
                 }
-                op_group = inplace_op_groups[cand]
             else:
                 mem = ac_stats.memory[cand]
                 runtime = ac_stats.runtimes[cand]
                 func_names = {ac_stats.func_names[cand]}
-                op_group = None
             msps = (mem / runtime) if runtime > 0 else sys.float_info.max
-            msps_meta.append(_MSPS(func_names, cand, op_group, mem, runtime, msps))
+            msps_meta.append(MSPS(func_names, cand, mem, runtime, msps))
         # We choose canidates to be recomputed based on increasing msps
         msps_meta.sort(key=lambda x: x.msps, reverse=True)
-        return stored_ops, recomputed_ops, msps_meta
+        return GreedyOrderMeta(recomputed_ops, stored_ops, inplace_op_groups, msps_meta)
 
-    def get_ac_tradeoff_stats(
+    def _get_ac_tradeoff_stats(
         self,
         ac_stats: ACStats,
+        greedy_order_meta: GreedyOrderMeta,
         n_segments: int = 2,
         save_tradeoff_graph: bool = False,
         filename: str = "ac_tradeoff",
@@ -423,8 +422,10 @@ class SACEstimator(TorchDispatchMode):
         except ImportError as err:
             raise ImportError("Please install pwlf package.") from err
 
-        stored_ops, recomputed_ops, msps_meta = self._get_greedy_order(
-            ac_stats=ac_stats
+        stored_ops, recomputed_ops, msps_meta = (
+            greedy_order_meta.stored_ops,
+            greedy_order_meta.recomputed_ops,
+            greedy_order_meta.msps_meta,
         )
         # Intitialize the discarded memory and recomputation runtime to sum of already chosen recomputed_ops
         discarded_mem = sum((ac_stats.memory[op_idx] for op_idx in recomputed_ops))
@@ -482,9 +483,8 @@ class SACEstimator(TorchDispatchMode):
             plt.ylabel("Recomp time / Total recomp time")
             plt.xlabel("Memory discarded / Total memory")
             plt.legend()
-            plt.title(
-                f"{filename} Total Memory = {ac_memory} B Total Runtime = {ac_runtime} ms"
-            )
+            plt.title(f"{filename}")
+            plt.suptitle(f"Total Memory = {ac_memory} B Total Runtime = {ac_runtime:.4f} ms", fontsize=10)
             folder_name = "tradeoff_graphs"
             if not os.path.exists(folder_name):
                 os.makedirs(folder_name)
@@ -512,19 +512,20 @@ class SACEstimator(TorchDispatchMode):
 
     def display_ac_stats(self, ac_stats: ACStats, print_tabular: bool) -> None:
         print(
-            f"Total Memory: {sum(ac_stats.memory)} Store Random: {ac_stats.force_store_random}"
+            f"Total Memory: {sum(ac_stats.memory)} B Total Runtime: {sum(ac_stats.runtimes)} ms"
+            f" Store Random: {ac_stats.force_store_random}"
         )
         table_data = []
         op_parent = dict(ac_stats.inplace_ops)
         for i, fn_name in enumerate(ac_stats.func_names):
             row = [
-                i,
+                str(i),
                 fn_name,
-                ac_stats.runtimes[i],
-                ac_stats.memory[i],
-                i in ac_stats.view_like_ops,
-                i in ac_stats.rand_ops,
-                op_parent.get(i, None),
+                f"{ac_stats.runtimes[i]:.4f}",
+                str(ac_stats.memory[i]),
+                str(i in ac_stats.view_like_ops),
+                str(i in ac_stats.rand_ops),
+                str(op_parent.get(i, None)),
             ]
             table_data.append(row)
         # Define headers
@@ -540,20 +541,120 @@ class SACEstimator(TorchDispatchMode):
         if print_tabular:
             _display_stats_tabular(headers, table_data)
         else:
-            max_name_width = max(len(row[1]) for row in table_data)
+            max_widths = [0 for _ in range(len(headers))]
             table_data.insert(0, headers)
             for row in table_data:
-                formatted_row = []
                 for i, elem in enumerate(row):
-                    max_width = max_name_width if i == 1 else 12
-                    if elem is None:
-                        fs = "-"
-                    elif isinstance(elem, float):
-                        fs = f"{elem:<{max_width}.6f}"
-                    else:
-                        fs = f"{str(elem):<{max_width}}"
-                    formatted_row.append(fs)
-                print("\t".join(formatted_row))
+                    max_widths[i] = max(max_widths[i], len(elem))
+            for row in table_data:
+                print(
+                    "\t".join(
+                        [f"{elem:<{max_widths[i]}}" for i, elem in enumerate(row)]
+                    )
+                )
+
+    def display_ac_tradeoff_stats(
+        self,
+        greedy_order_meta: GreedyOrderMeta,
+        ac_stats: ACStats,
+        print_tabular: bool = False,
+    ):
+        table_data = []
+        total_memory, total_runtime = sum(ac_stats.memory), sum(ac_stats.runtimes)
+        discarded_mem = recomp_runtime = 0
+
+        def append_row(
+            op_indices: Set[int],
+            func_names: Set[str],
+            msps: Optional[float] = None,
+            stored: Optional[bool] = False,
+            recomputed: Optional[bool] = False,
+        ):
+            row = [
+                str(op_indices),
+                str(func_names),
+                f"{discarded_mem / total_memory:.4f}",
+                str(discarded_mem),
+                f"{recomp_runtime / total_runtime:.4f}",
+                str(recomp_runtime),
+                f"{msps:.2e}" if msps is not None else str(nan),
+                str(stored),
+                str(recomputed),
+            ]
+            table_data.append(row)
+
+        stored_ops, recomputed_ops, inplace_op_groups, msps_meta = (
+            greedy_order_meta.stored_ops,
+            greedy_order_meta.recomputed_ops,
+            greedy_order_meta.inplace_op_groups,
+            greedy_order_meta.msps_meta,
+        )
+
+        for op_idx in recomputed_ops:
+            op_indices: Set[int] = {op_idx}
+            if op_idx in inplace_op_groups:
+                op_indices.update(inplace_op_groups[op_idx])
+            discarded_mem += sum(ac_stats.memory[i] for i in op_indices)
+            recomp_runtime += sum(ac_stats.runtimes[i] for i in op_indices)
+            func_names = {ac_stats.func_names[i] for i in op_indices}
+            append_row(op_indices, func_names, recomputed=True)
+
+        for cand in msps_meta:
+            discarded_mem += cand.memory
+            recomp_runtime += cand.runtime
+            op_indices: Set[int] = {cand.op_idx}
+            if cand.op_idx in inplace_op_groups:
+                op_indices.update(inplace_op_groups[cand.op_idx])
+            append_row(op_indices, cand.func_names, msps=cand.msps)
+
+        for op_idx in stored_ops:
+            op_indices: Set[int] = {op_idx}
+            if op_idx in inplace_op_groups:
+                op_indices.update(inplace_op_groups[op_idx])
+            discarded_mem += sum(ac_stats.memory[i] for i in op_indices)
+            recomp_runtime += sum(ac_stats.runtimes[i] for i in op_indices)
+            func_names = {ac_stats.func_names[i] for i in op_indices}
+            append_row(op_indices, func_names, stored=True)
+
+        headers = [
+            "Op Id(s)",
+            "Op Name(s)",
+            "Discarded Mem (%)",
+            "Discarded Mem (B)",
+            "Recomp time (%)",
+            "Recomp time (ms)",
+            "MSPS",
+            "Always Stored",
+            "Always Recomputed",
+        ]
+        if print_tabular:
+            _display_stats_tabular(headers, table_data)
+        else:
+            max_widths = [0 for _ in range(len(headers))]
+            table_data.insert(0, headers)
+            for row in table_data:
+                for i, elem in enumerate(row):
+                    max_widths[i] = max(max_widths[i], len(elem))
+            for row in table_data:
+                print(
+                    "\t".join(
+                        [f"{elem:<{max_widths[i]}}" for i, elem in enumerate(row)]
+                    )
+                )
+
+    def calculate_ac_tradeoff_stats(
+        self,
+        n_segments: int = 2,
+        save_tradeoff_graphs: bool = False,
+    ):
+        for mod_fqn in self.ac_mod_stats.keys():
+            self.ac_mod_tradeoff_stats[mod_fqn] = self._get_ac_tradeoff_stats(
+                ac_stats=self.ac_mod_stats[mod_fqn],
+                greedy_order_meta=self.ac_mod_greedy_order_meta[mod_fqn],
+                n_segments=n_segments,
+                save_tradeoff_graph=save_tradeoff_graphs,
+                filename=mod_fqn,
+            )
 
     def display_modulewise_ac_stats(
         self, depth: int = 2, print_tabular: bool = False
@@ -564,16 +665,10 @@ class SACEstimator(TorchDispatchMode):
                 continue
             print(f"Module: {mod_fqn}")
             self.display_ac_stats(ac_stats, print_tabular)
-
-    def display_ac_tradeoff_stats(
-        self, ac_tradeoff_stats: ACTradeOffStats, print_tabular: bool = False
-    ):
-        pass
-
-    def display_modulewise_ac_tradeoff_stats(
-        self, depth: int = 2, print_tabular: bool = False
-    ) -> None:
-        pass
+            print(f"AC Trade-off for Module: {mod_fqn} MSPS = Memory/Runtime")
+            self.display_ac_tradeoff_stats(
+                self.ac_mod_greedy_order_meta[mod_fqn], ac_stats, print_tabular
+            )
 
     def __enter__(self):
         fake_mode = active_fake_mode()
@@ -589,13 +684,5 @@ class SACEstimator(TorchDispatchMode):
         return super().__enter__()
 
     def __exit__(self, *args: Any):
-        for mod_fqn, ac_stats in self.ac_mod_stats.items():
-            print(f"Module: {mod_fqn}")
-            self.ac_mod_tradeoff_stats[mod_fqn] = self.get_ac_tradeoff_stats(
-                ac_stats=ac_stats,
-                save_tradeoff_graph=True,
-                filename=mod_fqn,
-            )
-
         self._mod_tracker.__exit__(*args)
         super().__exit__(*args)

@@ -1,7 +1,8 @@
 import json
-from typing import Callable, cast, List, Tuple, TypedDict
+from typing import Callable, cast, List, OrderedDict, Tuple, TypedDict
 
 import torch
+from ac_stats import collect_ac_tradeoff_stats
 from mem_stats import collect_mem_stats
 from runtime_stats import collect_runtime_stats
 from test_model import GPT, GPTConfig, loss_fn
@@ -35,6 +36,20 @@ class ModStats(TypedDict):
     fw_runtime_per_module: float
     # Total bw run-time of the module
     bw_runtime_per_module: float
+    # Total ac run-time of the module
+    ac_runtime: float
+    # Total ac_memory for the module
+    ac_memory: int
+    # Number of piecewise-linear functions used for approximating ac tradeoff curve
+    n_segments: int
+    # Slopes of the of piecewise-linear functions
+    slopes: List[float]
+    # Intercepts of the of piecewise-linear functions
+    intercepts: List[float]
+    # X breakpoints of the of piecewise-linear functions
+    breakpoints: List[float]
+    # Original trade-off curve
+    tradeoff_curve: OrderedDict[float, float]
 
 
 class ModuleInfo(TypedDict):
@@ -61,6 +76,7 @@ def aggregate_stats(
         fw_post_order,
         bw_post_order,
     ) = collect_runtime_stats(model, optimizer, inp_and_target, loss_fn)
+    mod_ac_tradeoff_stats = collect_ac_tradeoff_stats(model, inp_and_target, loss_fn)
     module_info: ModuleInfo = {
         "fw_pre_order": fw_pre_order,
         "bw_pre_order": bw_pre_order,
@@ -103,6 +119,15 @@ def aggregate_stats(
                 "output_per_module": mod_mem_stat.output_mem,
                 "fw_runtime_per_module": mod_runtime_stats[mod_mem_stat.mod_fqn]["fw"],
                 "bw_runtime_per_module": mod_runtime_stats[mod_mem_stat.mod_fqn]["bw"],
+                "ac_runtime": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].ac_runtime,
+                "ac_memory": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].ac_memory,
+                "n_segments": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].n_segments,
+                "slopes": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].slopes,
+                "intercepts": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].intercepts,
+                "breakpoints": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].fit_breaks,
+                "tradeoff_curve": mod_ac_tradeoff_stats[
+                    mod_mem_stat.mod_fqn
+                ].tradeoff_curve,
             }
             module_info["modstats"].append(mod_stat)
     if export_to_json:

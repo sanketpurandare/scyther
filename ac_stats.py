@@ -17,6 +17,7 @@ def collect_ac_tradeoff_stats(
     inp, target = inp_and_target
     with SACEstimator() as sace:
         loss = loss_fn(model(inp), target)
+    sace.calculate_ac_tradeoff_stats(n_segments=2, save_tradeoff_graphs=True)
     sace.display_modulewise_ac_stats(depth=4, print_tabular=True)
     return copy.deepcopy(sace.ac_mod_tradeoff_stats)
 
