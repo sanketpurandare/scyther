@@ -642,7 +642,7 @@ class SACEstimator(TorchDispatchMode):
                     )
                 )
 
-    def calculate_ac_tradeoff_stats(
+    def pwlf_ac_tradeoff_stats(
         self,
         n_segments: int = 2,
         save_tradeoff_graphs: bool = False,

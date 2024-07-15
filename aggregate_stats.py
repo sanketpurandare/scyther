@@ -1,5 +1,6 @@
 import json
-from typing import Callable, cast, List, OrderedDict, Tuple, TypedDict
+from collections import OrderedDict
+from typing import Callable, cast, List, Tuple, TypedDict
 
 import torch
 from ac_stats import collect_ac_tradeoff_stats
@@ -36,6 +37,8 @@ class ModStats(TypedDict):
     fw_runtime_per_module: float
     # Total bw run-time of the module
     bw_runtime_per_module: float
+    # Is this module a leaf module
+    is_leaf: bool
     # Total ac run-time of the module
     ac_runtime: float
     # Total ac_memory for the module
@@ -89,6 +92,21 @@ def aggregate_stats(
         mod_mem_stat = mod_mem_stats.get(mod, None)
         if mod_mem_stat:
             mod_mem_stat = cast(_ModMemStats, mod_mem_stat)
+            if tradeoff_stats := mod_ac_tradeoff_stats.get(mod_mem_stat.mod_fqn, None):
+                ac_runtime = tradeoff_stats.ac_runtime
+                ac_memory = tradeoff_stats.ac_memory
+                n_segments = tradeoff_stats.n_segments
+                slopes = tradeoff_stats.slopes
+                intercepts = tradeoff_stats.intercepts
+                breakpoints = tradeoff_stats.fit_breaks
+                tradeoff_curve = tradeoff_stats.tradeoff_curve
+                is_leaf = False
+            else:
+                ac_runtime = ac_memory = n_segments = 0
+                slopes = intercepts = breakpoints = []
+                tradeoff_curve: OrderedDict[float, float] = OrderedDict()
+                is_leaf = True
+
             mod_stat: ModStats = {
                 "fqn": mod_mem_stat.mod_fqn,
                 "param_per_module": mod_mem_stat.parameter_mem,
@@ -119,15 +137,14 @@ def aggregate_stats(
                 "output_per_module": mod_mem_stat.output_mem,
                 "fw_runtime_per_module": mod_runtime_stats[mod_mem_stat.mod_fqn]["fw"],
                 "bw_runtime_per_module": mod_runtime_stats[mod_mem_stat.mod_fqn]["bw"],
-                "ac_runtime": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].ac_runtime,
-                "ac_memory": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].ac_memory,
-                "n_segments": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].n_segments,
-                "slopes": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].slopes,
-                "intercepts": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].intercepts,
-                "breakpoints": mod_ac_tradeoff_stats[mod_mem_stat.mod_fqn].fit_breaks,
-                "tradeoff_curve": mod_ac_tradeoff_stats[
-                    mod_mem_stat.mod_fqn
-                ].tradeoff_curve,
+                "is_leaf": is_leaf,
+                "ac_runtime": ac_runtime,
+                "ac_memory": ac_memory,
+                "n_segments": n_segments,
+                "slopes": slopes,
+                "intercepts": intercepts,
+                "breakpoints": breakpoints,
+                "tradeoff_curve": tradeoff_curve,
             }
             module_info["modstats"].append(mod_stat)
     if export_to_json:

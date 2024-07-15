@@ -284,6 +284,7 @@ class RuntimeEstimator(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
         res = func(*args, **kwargs or {})
+        # FIXME @sanketpurandare: faltten tensors by desugaring the tensor subclasses
         op_time = self._estimate(func, args, kwargs, res)
         for par in self._mod_tracker.parents:
             if self._mod_tracker.is_bw:
