@@ -2,7 +2,7 @@ import copy
 from typing import Callable, Tuple
 
 import torch
-from runtime_estimator import EstimateMode
+from runtime_estimator import RuntimeEstimator
 from test_model import GPT, GPTConfig, loss_fn
 from torch import nn, optim
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -29,7 +29,7 @@ def collect_runtime_stats(
     # Initializing optimizer states and warm-up
     inner(warm_up_iters)
 
-    estimate_mode = EstimateMode()
+    estimate_mode = RuntimeEstimator()
     with estimate_mode(estimate_mode_type="operator-level-cost-model"):
         start = timer()
         inner(actual_iters)

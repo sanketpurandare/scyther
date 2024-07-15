@@ -1,6 +1,6 @@
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, Tuple
+from typing import Callable, Dict, Set
 
 import torch
 import torch.utils._pytree as pytree
@@ -14,70 +14,73 @@ from torch.utils.flop_counter import flop_registry
 
 aten = torch.ops.aten
 
-__all__ = ["EstimateMode"]
+# No fall-back kernel needed/exists for view ops
+_IGNORE_OPS = {
+    aten.lift_fresh,
+    aten.t,
+    aten.transpose,
+    aten.view,
+    aten.detach,
+    aten._unsafe_view,
+    aten.split,
+    aten.adjoint,
+    aten.as_strided,
+    aten.diagonal,
+    aten.expand,
+    aten.expand_as,
+    aten.movedim,
+    aten.permute,
+    aten.select,
+    aten.squeeze,
+    aten.mT,
+    aten.mH,
+    aten.real,
+    aten.imag,
+    aten.view_as,
+    aten.unflatten,
+    aten.unfold,
+    aten.unbind,
+    aten.unsqueeze,
+    aten.vsplit,
+    aten.hsplit,
+    aten.split_with_sizes,
+    aten.swapaxes,
+    aten.swapdims,
+    aten.chunk,
+}
+# We can ignore benchmarking tensor create ops
+_CREATE_OPS = {
+    aten.randint,
+    aten.randn,
+    aten.rand,
+    aten.randn_like,
+    aten.rand_like,
+    aten.randint_like,
+    aten.arange,
+    aten.ones_like,
+    aten.zeros_like,
+}
+
+_IGNORE_OPS_EXT = _IGNORE_OPS | _CREATE_OPS
+
+__all__ = ["RuntimeEstimator"]
 
 
-class EstimateMode(TorchDispatchMode):
+class RuntimeEstimator(TorchDispatchMode):
+    _gpu_memory_bandwidth = get_gpu_dram_gbps()
+    _float_types: Set[torch.dtype] = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    }
+    _no_fallback_kernel = set()
+    fake_mode: FakeTensorMode
+
     def __init__(self):
-        self._fake_mode: FakeTensorMode
-        self._dispatch: Callable
+        self._estimate: Callable
         self._estimate_mode_type: str
         self._mod_tracker = ModTracker()
-        # No fall-back kernel needed/exists for view ops
-        self._ignore_ops = {
-            aten.lift_fresh,
-            aten.t,
-            aten.transpose,
-            aten.view,
-            aten.detach,
-            aten._unsafe_view,
-            aten.split,
-            aten.adjoint,
-            aten.as_strided,
-            aten.diagonal,
-            aten.expand,
-            aten.expand_as,
-            aten.movedim,
-            aten.permute,
-            aten.select,
-            aten.squeeze,
-            aten.mT,
-            aten.mH,
-            aten.real,
-            aten.imag,
-            aten.view_as,
-            aten.unflatten,
-            aten.unfold,
-            aten.unbind,
-            aten.unsqueeze,
-            aten.vsplit,
-            aten.hsplit,
-            aten.split_with_sizes,
-            aten.swapaxes,
-            aten.swapdims,
-            aten.chunk,
-        }
-        # We can ignore benchmarking tensor create ops
-        self._ignore_ops_extended = {
-            aten.randint,
-            aten.randn,
-            aten.rand,
-            aten.randn_like,
-            aten.rand_like,
-            aten.randint_like,
-            aten.arange,
-            aten.ones_like,
-            aten.zeros_like,
-        }
-        self._ignore_ops_extended.update(self._ignore_ops)
-        self._gpu_memory_bandwidth = get_gpu_dram_gbps()
-        self._float_types = {
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-            torch.float64,
-        }
-        self._no_fallback_kernel = set()
         self.mod_runtimes: Dict[str, Dict[str, float]] = defaultdict(
             lambda: defaultdict(lambda: 0.0)
         )
@@ -87,11 +90,11 @@ class EstimateMode(TorchDispatchMode):
         self.mod_bw_post_order = []
         self.total_runtime: float = 0.0
 
-    # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py#L1838
+    # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_subclasses/fake_tensor.py#L1969  # noqa
     # NB: returns fake tensors
-
+    @classmethod
     def _maybe_run_and_benchmark_fallback_kernel(
-        self,
+        cls,
         func,
         args,
         kwargs,
@@ -110,8 +113,8 @@ class EstimateMode(TorchDispatchMode):
         with no_dispatch():
 
             def to_real_tensor(e):
-                if self._fake_mode.is_our_fake(e):
-                    if e.dtype in self._float_types:
+                if cls.fake_mode.is_our_fake(e):
+                    if e.dtype in cls._float_types:
                         out = torch.rand_like(e, device=e.fake_device)
                     else:
                         out = torch.ones_like(e, device=e.fake_device)
@@ -163,34 +166,36 @@ class EstimateMode(TorchDispatchMode):
                 if id(e) in inp_impls:
                     return inp_impls[id(e)]
                 else:
-                    return self._fake_mode.fake_tensor_converter.from_real_tensor(
-                        self._fake_mode, e
+                    return cls.fake_mode.fake_tensor_converter.from_real_tensor(
+                        cls.fake_mode, e
                     )
             else:
                 return e
 
         return (pytree.tree_map(map_out, r), mean_op_time)
 
-    def _dispatch_benchmark_estimate(self, func, args, kwargs) -> Tuple[Any, float]:
+    @classmethod
+    def _benchmark_estimate(cls, func, args, kwargs, res) -> float:
+        assert isinstance(
+            cls.fake_mode, FakeTensorMode
+        ), "Initialize/Assign FakeTensorMode before using this function"
         mean_op_time = 0.0
-        if func._overloadpacket not in self._ignore_ops_extended:
+        if func._overloadpacket not in _IGNORE_OPS_EXT:
             try:
-
-                res, mean_op_time = self._maybe_run_and_benchmark_fallback_kernel(
+                res, mean_op_time = cls._maybe_run_and_benchmark_fallback_kernel(
                     func,
                     args,
                     kwargs,
                     NotImplementedError,
                 )
-                return res, mean_op_time
+                return mean_op_time
             except NotImplementedError:
-                self._no_fallback_kernel.add(func._overloadpacket)
-        res = func(*args, **kwargs or {})
-        return res, mean_op_time
+                cls._no_fallback_kernel.add(func._overloadpacket)
+        return mean_op_time
 
-    # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py#L563
-
-    def _dispatch_inductor_estimate(self, func, args, kwargs) -> Tuple[Any, float]:
+    # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589  # noqa
+    @classmethod
+    def _inductor_estimate(cls, func, args, kwargs, out) -> float:
         def get_num_bytes(t: torch.Tensor) -> int:
             st = t.untyped_storage()
             num_bytes = st.size() * st.element_size()
@@ -229,14 +234,12 @@ class EstimateMode(TorchDispatchMode):
             counted_bytes = read_bytes + write_bytes
             # The GPU memory bandwidth is in GB/s so the transfer time
             # is in nano seconds
-            transfer_time = counted_bytes / self._gpu_memory_bandwidth
+            transfer_time = counted_bytes / cls._gpu_memory_bandwidth
             return transfer_time
 
-        kwargs = kwargs if kwargs else {}
-        out = func(*args, **kwargs)
         op_time = 0.0
         func_packet = func._overloadpacket
-        if func_packet not in self._ignore_ops:
+        if func_packet not in _IGNORE_OPS:
 
             flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
             flat_outs, out_spec = pytree.tree_flatten(out)
@@ -245,7 +248,7 @@ class EstimateMode(TorchDispatchMode):
             out_dtypes = {
                 t.dtype
                 for t in flat_outs
-                if isinstance(t, torch.Tensor) and t.dtype in self._float_types
+                if isinstance(t, torch.Tensor) and t.dtype in cls._float_types
             }
 
             args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
@@ -256,7 +259,7 @@ class EstimateMode(TorchDispatchMode):
             # compute time. We divide by 1e6 to get the time in ms
             op_time = max(transfer_time, compute_time) / 1e6
 
-        return out, op_time
+        return op_time
 
     def display_modulewise_stats(self, depth: int = 2):
         print("Pre-Forward Execution Order: ")
@@ -280,7 +283,8 @@ class EstimateMode(TorchDispatchMode):
             )
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
-        res, op_time = self._dispatch(func, args, kwargs)
+        res = func(*args, **kwargs or {})
+        op_time = self._estimate(func, args, kwargs, res)
         for par in self._mod_tracker.parents:
             if self._mod_tracker.is_bw:
                 self.mod_runtimes[par]["bw"] += op_time
@@ -291,9 +295,9 @@ class EstimateMode(TorchDispatchMode):
 
     def __call__(self, estimate_mode_type: str):
         if estimate_mode_type == "operator-level-benchmark":
-            self._dispatch = self._dispatch_benchmark_estimate
+            self._estimate = RuntimeEstimator._benchmark_estimate
         elif estimate_mode_type == "operator-level-cost-model":
-            self._dispatch = self._dispatch_inductor_estimate
+            self._estimate = RuntimeEstimator._inductor_estimate
         else:
             raise NotImplementedError(
                 f"estimate_mode_type {estimate_mode_type} not supported"
@@ -306,7 +310,7 @@ class EstimateMode(TorchDispatchMode):
         assert isinstance(
             fake_mode, FakeTensorMode
         ), "No FakeTensorMode found, designed to used under FakeTensorMode"
-        self._fake_mode = fake_mode
+        RuntimeEstimator.fake_mode = fake_mode
         self.total_runtime = 0.0
         self.mod_runtimes = defaultdict(lambda: defaultdict(lambda: 0.0))
         self.mod_fw_pre_order.clear()

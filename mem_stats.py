@@ -39,7 +39,7 @@ def collect_mem_stats(
             mod_stats.snapshots.setdefault(_ModState.POST_BW, []).append(
                 copy.deepcopy(last_snapshot)
             )
-    mt.display_modulewise_snapshots(depth=4, units="MiB", tabulate=True)
+    mt.display_modulewise_snapshots(depth=6, units="MiB", tabulate=True)
     mt.display_snapshot("peak", units="MiB", tabulate=True)
     if not active_fake_mode() and torch.cuda.is_available():
         dev = torch.device(torch.cuda.current_device())
@@ -63,7 +63,7 @@ if __name__ == "__main__":
             n_layer=n_layer,
             vocab_size=vocab_size,
             dropout=0.01,
-            checkpoint_activations=False,
+            checkpoint_activations=True,
         )
         with torch.device(dev):
             model = GPT(config)

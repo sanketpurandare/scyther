@@ -2,8 +2,8 @@ import json
 from typing import Callable, cast, List, Tuple, TypedDict
 
 import torch
-from module_mem_stats import collect_mem_stats
-from module_runtime_stats import collect_runtime_stats
+from mem_stats import collect_mem_stats
+from runtime_stats import collect_runtime_stats
 from test_model import GPT, GPTConfig, loss_fn
 from torch import nn, optim
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -40,6 +40,8 @@ class ModStats(TypedDict):
 class ModuleInfo(TypedDict):
     fw_pre_order: List[str]
     bw_pre_order: List[str]
+    fw_post_order: List[str]
+    bw_post_order: List[str]
     modstats: List[ModStats]
 
 
