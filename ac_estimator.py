@@ -484,7 +484,10 @@ class SACEstimator(TorchDispatchMode):
             plt.xlabel("Memory discarded / Total memory")
             plt.legend()
             plt.title(f"{filename}")
-            plt.suptitle(f"Total Memory = {ac_memory} B Total Runtime = {ac_runtime:.4f} ms", fontsize=10)
+            plt.suptitle(
+                f"Total Memory = {ac_memory} B Total Runtime = {ac_runtime:.4f} ms",
+                fontsize=10,
+            )
             folder_name = "tradeoff_graphs"
             if not os.path.exists(folder_name):
                 os.makedirs(folder_name)
