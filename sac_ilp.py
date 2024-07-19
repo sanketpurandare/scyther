@@ -11,10 +11,9 @@ Command to run:
 import argparse
 import json
 import logging
-from typing import Dict, List
 
 import numpy as np
-from aggregate_stats import ModStats
+from ilp_utils import display_bytes, Graph, parse_input
 from pulp import (
     COIN_CMD,
     HiGHS_CMD,
@@ -40,65 +39,6 @@ handler.setLevel(logging.INFO)
 
 # Add the handler to the logger
 logger.addHandler(handler)
-
-
-class Node(ModStats):
-    index: int = 0  # index according to forward pre-order
-    pos_fw_post_order: int = 0  # index according to forward post-order
-
-
-class Graph:
-    def __init__(self, name: str, n: int) -> None:
-        self.name: str = name
-        self.nodes: List[Node] = []
-        self.name2node: Dict[str, Node] = {}
-        self.ad_matrix = np.zeros((n, n))
-        self.fw_post_order: List[str] = []
-
-    def add_node(self, node: Node) -> None:
-        self.nodes.append(node)
-        self.name2node[node["fqn"]] = node
-
-
-def parse_input(filename: str) -> Graph:
-    with open(filename, "r") as f:
-        module_info = json.load(f)
-
-    # assertion and number of nodes
-    assert len(module_info["modstats"]) == len(module_info["fw_pre_order"])
-    n_nodes = len(module_info["modstats"])
-
-    # create graph
-    model_name = filename.split("_")[0]
-    g = Graph(model_name, n_nodes)
-    g.fw_post_order = module_info["fw_post_order"]
-
-    # sort the modules by pre-order and add them to the graph
-    module_info["modstats"] = sorted(
-        module_info["modstats"],
-        key=lambda x: module_info["fw_pre_order"].index(x["fqn"]),
-    )
-    for i, mod_info in enumerate(module_info["modstats"]):
-        node: Node = mod_info
-        node["index"] = i
-        node["pos_fw_post_order"] = g.fw_post_order.index(node["fqn"])
-        g.add_node(node)
-
-    # set up ancestor-descendant matrix
-    def is_self_or_submodule(name_descendant: str, name_ancestor: str) -> bool:
-        # if name_descendant is a submodule of name_ancestor, or if they are the same
-        return (
-            name_descendant == name_ancestor or name_ancestor + "." in name_descendant
-        )
-
-    for i in range(n_nodes):
-        for j in range(i, n_nodes):
-            if is_self_or_submodule(g.nodes[j]["fqn"], g.nodes[i]["fqn"]):
-                g.ad_matrix[i][j] = 1
-            else:
-                break
-
-    return g
 
 
 def sac_milp(
@@ -161,7 +101,7 @@ def sac_milp(
             continue
         prob += a[i] + lpDot(coeff, d) == TA_i + AG_i
 
-    # [Constraint] Express the total amount memory at each module
+    # [Constraint] Express the total amount of memory at each module
     P_1 = g.nodes[0]["param_per_module"]
     for i in range(num_nodes):
         TG_i = g.nodes[i]["grad_total"]
@@ -189,10 +129,10 @@ def sac_milp(
 
     # [Constraint] Express recomputation time rec_i = y_i * (rep_i * FCP_i)
     for i in range(num_nodes):
-        ACTT_i = g.nodes[i]["ac_runtime"]
+        ACT_i = g.nodes[i]["ac_runtime"]
         prob += rct[i] <= M * y[i]
-        prob += rct[i] <= ACTT_i * rcp[i]
-        prob += rct[i] >= ACTT_i * rcp[i] - M * (1 - y[i])
+        prob += rct[i] <= ACT_i * rcp[i]
+        prob += rct[i] >= ACT_i * rcp[i] - M * (1 - y[i])
 
     # [Constraint] Peak memory should be below budget
     prob += peak_mem <= memory_budget
@@ -234,19 +174,6 @@ def sac_milp(
                 + f"rcp_i = {rcp_i:8.4f} "
                 + f"rct_i = {rct_i:8.4f} "
             )
-
-
-def display_bytes(b: int, unit: str = "B") -> str:
-    """
-    return a string that represent the number of bytes in a desired unit
-    """
-    if unit == "KiB":
-        return f"{b/2**10:.2f} KiB"
-    if unit == "MiB":
-        return f"{b/2**20:.2f} MiB"
-    if unit == "GiB":
-        return f"{b/2**30:.2f} GiB"
-    return f"{b:.2f} bytes"
 
 
 def parse_args() -> argparse.Namespace:
