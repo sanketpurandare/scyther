@@ -1,7 +1,18 @@
 import math
 from typing import Tuple
+
 import torch
-from torch._inductor.comm_analysis import baseLat, get_gpu_type, hwLat, llMaxBws, NCCL_COLL, NCCL_HW, NCCL_PROTO, NCCL_ALGO
+from torch._inductor.comm_analysis import (
+    baseLat,
+    get_gpu_type,
+    hwLat,
+    llMaxBws,
+    NCCL_ALGO,
+    NCCL_COLL,
+    NCCL_HW,
+    NCCL_PROTO,
+)
+
 
 def estimate_nccl_collective_lat_and_bw(
     coll: NCCL_COLL,
