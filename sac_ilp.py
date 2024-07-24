@@ -3,8 +3,8 @@ To use the HiGHS solver, you need to install it first and pass the path to the s
 Follow instructions here: https://ergo-code.github.io/HiGHS/dev/interfaces/cpp/
 
 Command to run:
-    python sac_ilp.py --in_file=GPT_modules_info.json --memory_budget=7.5
-    python sac_ilp.py --in_file=GPT_modules_info.json --memory_budget=7.5 \
+    python sac_ilp.py --in_file=GPT_modules_info.json --memory_budget=6
+    python sac_ilp.py --in_file=GPT_modules_info.json --memory_budget=6 \
         --solver=HiGHS --solver_path=/home/xuanzh/local/HiGHS/build/bin/highs
 """
 
@@ -51,10 +51,10 @@ def sac_milp(
     Objective: minimize recomputation time.
     Constratint: memory budget (in bytes).
     #TODO: link doc with formulation
-    #TODO: change unit for memory from bytes to MiB or GiB
     """
     num_nodes = len(g.nodes)
     M = 10**2  # note: numerical issue may occur if M is too big
+    MEM_MULTIPLIER = 2**30
 
     # Create a MILP problem
     prob = LpProblem("SAC", LpMinimize)
@@ -83,16 +83,16 @@ def sac_milp(
 
     # [Constraint] Express amount of discarded activation memory
     for i in range(num_nodes):
-        ACM_i = g.nodes[i]["ac_memory"]
-        IA_i = g.nodes[i]["act_fw_per_module"]
+        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += d[i] == ACM_i * r[i] - (ACM_i - IA_i) * y[i]
 
     # [Constraint] Express total activation memory in the backward pass
     for i in range(num_nodes):
-        AG_i = g.nodes[i]["act_grad_per_module"]
-        TA_i = g.nodes[i]["act_total"]
-        ACM_i = g.nodes[i]["ac_memory"]
-        IA_i = g.nodes[i]["act_fw_per_module"]
+        AG_i = g.nodes[i]["act_grad_per_module"] / MEM_MULTIPLIER
+        TA_i = g.nodes[i]["act_total"] / MEM_MULTIPLIER
+        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         # related to discarded amount of memory
         pos = g.nodes[i]["pos_fw_post_order"]
         coeff = np.zeros(num_nodes)
@@ -104,9 +104,9 @@ def sac_milp(
         prob += a[i] + lpDot(coeff, d) == TA_i + AG_i
 
     # [Constraint] Express the total amount of memory at each module
-    P_1 = g.nodes[0]["param_per_module"]
+    P_1 = g.nodes[0]["param_per_module"] / MEM_MULTIPLIER
     for i in range(num_nodes):
-        TG_i = g.nodes[i]["grad_total"]
+        TG_i = g.nodes[i]["grad_total"] / MEM_MULTIPLIER
         prob += m[i] - a[i] == P_1 + TG_i
 
     # [Constraint] Express peak memory
@@ -118,8 +118,8 @@ def sac_milp(
         prob += y[i] >= r[i]
         if g.nodes[i]["is_leaf"]:
             continue
-        ACM_i = g.nodes[i]["ac_memory"]
-        IA_i = g.nodes[i]["act_fw_per_module"]
+        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += r[i] >= (ACM_i - IA_i) / ACM_i * y[i]
 
     # [Constraint] Express percentage of recomputation time
@@ -158,7 +158,8 @@ def sac_milp(
             ac_decisions[g.nodes[i]["fqn"]] = round(r[i].varValue, 4)
     logger.info(f"AC decisions are {json.dumps(ac_decisions, indent=2)}")
     logger.info(f"recomputation time is {round(value(prob.objective), 2)} ms")
-    logger.info(f"peak memory is below {display_bytes(max_m.varValue, 'GiB')}")
+    peak_mem = max_m.varValue * MEM_MULTIPLIER
+    logger.info(f"peak memory is below {display_bytes(peak_mem, 'GiB')}")
 
     if verbose:
         logger.info("\n\n --------- DETAILS ---------")
@@ -167,9 +168,9 @@ def sac_milp(
                 continue
             y_i = y[i].varValue
             r_i = r[i].varValue
-            d_i = d[i].varValue
-            a_i = a[i].varValue
-            m_i = m[i].varValue
+            d_i = d[i].varValue * MEM_MULTIPLIER
+            a_i = a[i].varValue * MEM_MULTIPLIER
+            m_i = m[i].varValue * MEM_MULTIPLIER
             rcp_i = rcp[i].varValue if rcp[i].varValue else 0
             rct_i = rct[i].varValue
             logger.info(
@@ -258,7 +259,7 @@ def main():
             logger.error("HiGHS solver not found. Using CBC instead.")
     sac_milp(
         g,
-        memory_budget=args.memory_budget * 2**30,
+        memory_budget=args.memory_budget,
         solver=solver,
         verbose=args.verbose,
     )
