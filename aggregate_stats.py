@@ -160,6 +160,7 @@ if __name__ == "__main__":
         config = GPTConfig(
             block_size=512,
             n_layer=n_layer,
+            n_embd=768 * 4,
             vocab_size=vocab_size,
             dropout=0.01,
             checkpoint_activations=False,
@@ -168,7 +169,7 @@ if __name__ == "__main__":
             model = GPT(config)
         optimizer = optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 64, 512
+        bsz, seq_len = 2, 512
         src = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
         inp = (src, tgt)
