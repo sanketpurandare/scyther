@@ -14,7 +14,7 @@ import argparse
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 from comm_analysis import NCCL_COLL
@@ -61,6 +61,7 @@ def fsdp_milp(
     comm_params: Dict[str, CommParams],
     memory_budget: int,
     solver: COIN_CMD,
+    fsdp_units: List[str] = None,
     selective_ac: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -108,10 +109,18 @@ def fsdp_milp(
     prob += x[0] == 1
 
     # [Constraint] No nested FSDP unit
-    for i in range(1, num_nodes):
-        for j in range(i + 1, num_nodes):
-            if graph.ad_matrix[i][j] == 1:
-                prob += x[i] + x[j] <= 1
+    if fsdp_units:
+        fsdp_units = set(fsdp_units)
+        for i in range(1, num_nodes):
+            if graph.nodes[i]["fqn"] in fsdp_units:
+                prob += x[i] == 1
+            else:
+                prob += x[i] == 0
+    else:
+        for i in range(1, num_nodes):
+            for j in range(i + 1, num_nodes):
+                if graph.ad_matrix[i][j] == 1:
+                    prob += x[i] + x[j] <= 1
 
     # [Constraint] Express parameter taken care of by each module for FSDP
     for i in range(1, num_nodes):
@@ -428,6 +437,7 @@ def main():
         comm_params=comm_params,
         memory_budget=args.memory_budget,
         solver=solver,
+        fsdp_units=args.fsdp_units,
         verbose=args.verbose,
     )
 
