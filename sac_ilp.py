@@ -11,6 +11,7 @@ Command to run:
 import argparse
 import json
 import logging
+import time
 
 import numpy as np
 from ilp_utils import display_bytes, Graph, parse_input
@@ -21,6 +22,7 @@ from pulp import (
     LpInteger,
     LpMinimize,
     LpProblem,
+    LpStatus,
     lpSum,
     LpVariable,
     PULP_CBC_CMD,
@@ -65,7 +67,7 @@ def sac_milp(
     m = LpVariable.matrix("m", list(range(num_nodes)), 0)
     rcp = LpVariable.matrix("rcp", list(range(num_nodes)), 0)
     rct = LpVariable.matrix("rct", list(range(num_nodes)), 0)
-    peak_mem = LpVariable("peak_mem", 0)
+    max_m = LpVariable("max_m", 0)
 
     # Add constraints
     # [Constraint] No nested AC units
@@ -109,7 +111,7 @@ def sac_milp(
 
     # [Constraint] Express peak memory
     for i in range(num_nodes):
-        prob += peak_mem >= m[i]
+        prob += max_m >= m[i]
 
     # [Constraint] Ensure correctness of r_i
     for i in range(num_nodes):
@@ -135,13 +137,19 @@ def sac_milp(
         prob += rct[i] >= ACT_i * rcp[i] - M * (1 - y[i])
 
     # [Constraint] Peak memory should be below budget
-    prob += peak_mem <= memory_budget
+    prob += max_m <= memory_budget
 
     # Set Objeictive
     prob += lpSum(rct)
 
     # Solve
-    prob.solve(solver)
+    start_time = time.time()
+    status = prob.solve(solver)
+    end_time = time.time()
+    logger.info(f"Solver completed in {round(end_time - start_time, 2)} sec")
+    if status != 1:
+        logger.info(f"Solver failed to find a solution: {LpStatus[status]}")
+        return
 
     # Print solution
     ac_decisions = {}
@@ -150,7 +158,7 @@ def sac_milp(
             ac_decisions[g.nodes[i]["fqn"]] = round(r[i].varValue, 4)
     logger.info(f"AC decisions are {json.dumps(ac_decisions, indent=2)}")
     logger.info(f"recomputation time is {round(value(prob.objective), 2)} ms")
-    logger.info(f"peak memory is {display_bytes(peak_mem.varValue, 'GiB')}")
+    logger.info(f"peak memory is below {display_bytes(max_m.varValue, 'GiB')}")
 
     if verbose:
         logger.info("\n\n --------- DETAILS ---------")
@@ -221,6 +229,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
 
+    parser.add_argument(
+        "--solver_msg",
+        help="Turn on/off solver messages",
+        action="store_true",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -233,13 +247,13 @@ def main():
     g = parse_input(args.in_file)
 
     # setup and solve the problem
-    solver = PULP_CBC_CMD(msg=args.verbose)
+    solver = PULP_CBC_CMD(msg=args.solver_msg)
     if args.solver == "HiGHS":
         try:
             if args.solver_path:
-                solver = HiGHS_CMD(path=args.solver_path, msg=args.verbose)
+                solver = HiGHS_CMD(path=args.solver_path, msg=args.solver_msg)
             else:
-                solver = HiGHS_CMD(msg=args.verbose)
+                solver = HiGHS_CMD(msg=args.solver_msg)
         except Exception:
             logger.error("HiGHS solver not found. Using CBC instead.")
     sac_milp(
