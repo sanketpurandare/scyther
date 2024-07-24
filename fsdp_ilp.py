@@ -2,12 +2,17 @@
 To use the HiGHS solver, you need to install it first and pass the path to the solver.
 Follow instructions here: https://ergo-code.github.io/HiGHS/dev/interfaces/cpp/
 
-Command to run:
-    python ilp.py --in_file=GPT_modules_info.json --memory_budget=7.5
+Some example commands to run:
+    python fsdp_ilp.py --in_file=GPT_modules_info.json --memory_budget=3
+    python fsdp_ilp.py --in_file=GPT_modules_info.json --memory_budget=4 --verbose
+    python fsdp_ilp.py --in_file=GPT_modules_info.json --memory_budget=4 --verbose \
+        --fsdp_units GPT.transformer.h.0 GPT.transformer.h.1 GPT.transformer.h.2 \
+        GPT.transformer.h.3 GPT.transformer.h.4 GPT.transformer.h.5
 """
 
 import argparse
 import logging
+import time
 from dataclasses import dataclass
 from typing import Dict
 
@@ -23,6 +28,7 @@ from pulp import (
     LpInteger,
     LpMinimize,
     LpProblem,
+    LpStatus,
     lpSum,
     LpVariable,
     PULP_CBC_CMD,
@@ -228,18 +234,28 @@ def fsdp_milp(
     prob += lpSum(fw_e[1:]) + lpSum(bw_e[1:]) + ag[0] + rs[0] + fw_ag[0] + bw_rs[0]
 
     # Solve
-    prob.solve(solver)
+    start_time = time.time()
+    status = prob.solve(solver)
+    end_time = time.time()
+    logger.info(f"Solver completed in {round(end_time - start_time, 2)} sec")
+    if status != 1:
+        logger.info(f"Solver failed to find a solution: {LpStatus[status]}")
+        return
 
     # Print solution
     fsdp_decisions = set()
     for i in range(num_nodes):
         if round(value(x[i]) if x[i] else 0) == 1:
             fsdp_decisions.add(graph.nodes[i]["fqn"])
-    logger.info(f"FSDP decisions are {fsdp_decisions}")
     peak_mem = (max_m.varValue + 2 * max_p.varValue) * MEM_MULTIPLIER
-    logger.info(f"peak memory is {display_bytes(peak_mem, 'GiB')}")
     obj = round(value(prob.objective), 4)
-    logger.info(f"total exposed computation time is {obj} ms")
+
+    logger.info(
+        f"On {world_size} GPUs\n"
+        + f"  FSDP units are {fsdp_decisions}\n"
+        + f"  peak memory is {display_bytes(peak_mem, 'GiB')}\n"
+        + f"  total exposed computation time is {obj} ms"
+    )
 
     if verbose:
         logger.info("\n\n --------- DETAILS ---------")
@@ -338,6 +354,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
 
+    parser.add_argument(
+        "--solver_msg",
+        help="Turn on/off solver messages",
+        action="store_true",
+    )
+
+    parser.add_argument("--fsdp_units", "--names-list", nargs="+", default=[])
+
     args = parser.parse_args()
     return args
 
@@ -362,13 +386,13 @@ def main():
     graph = parse_input(args.in_file)
 
     # setup and solve the problem
-    solver = PULP_CBC_CMD(msg=args.verbose)
+    solver = PULP_CBC_CMD(msg=args.solver_msg)
     if args.solver == "HiGHS":
         try:
             if args.solver_path:
-                solver = HiGHS_CMD(path=args.solver_path, msg=args.verbose)
+                solver = HiGHS_CMD(path=args.solver_path, msg=args.solver_msg)
             else:
-                solver = HiGHS_CMD(msg=args.verbose)
+                solver = HiGHS_CMD(msg=args.solver_msg)
         except Exception:
             logger.error("HiGHS solver not found. Using CBC instead.")
     fsdp_milp(
