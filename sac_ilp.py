@@ -44,7 +44,7 @@ logger.addHandler(handler)
 
 
 def sac_milp(
-    g: Graph, memory_budget: int, solver: COIN_CMD, verbose: bool = False
+    graph: Graph, memory_budget: int, solver: COIN_CMD, verbose: bool = False
 ) -> None:
     """
     MILP to decide which modules to AC and how much memory to discard.
@@ -52,7 +52,7 @@ def sac_milp(
     Constratint: memory budget (in bytes).
     #TODO: link doc with formulation
     """
-    num_nodes = len(g.nodes)
+    num_nodes = len(graph.nodes)
     M = 10**2  # note: numerical issue may occur if M is too big
     MEM_MULTIPLIER = 2**30
 
@@ -73,40 +73,38 @@ def sac_milp(
     # [Constraint] No nested AC units
     for i in range(num_nodes):
         for j in range(i + 1, num_nodes):
-            if g.ad_matrix[i][j] == 1:
+            if graph.ad_matrix[i][j] == 1:
                 prob += y[i] + y[j] <= 1
 
     # [Constraint] Do not AC leaf modules
     for i in range(num_nodes):
-        if g.nodes[i]["is_leaf"]:
+        if graph.nodes[i]["is_leaf"]:
             prob += y[i] == 0
 
     # [Constraint] Express amount of discarded activation memory
     for i in range(num_nodes):
-        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
-        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
+        ACM_i = graph.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += d[i] == ACM_i * r[i] - (ACM_i - IA_i) * y[i]
 
     # [Constraint] Express total activation memory in the backward pass
     for i in range(num_nodes):
-        AG_i = g.nodes[i]["act_grad_per_module"] / MEM_MULTIPLIER
-        TA_i = g.nodes[i]["act_total"] / MEM_MULTIPLIER
-        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
-        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
+        AG_i = graph.nodes[i]["act_grad_per_module"] / MEM_MULTIPLIER
+        TA_i = graph.nodes[i]["act_total"] / MEM_MULTIPLIER
+        ACM_i = graph.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         # related to discarded amount of memory
-        pos = g.nodes[i]["pos_fw_post_order"]
+        pos = graph.nodes[i]["pos_fw_post_order"]
         coeff = np.zeros(num_nodes)
-        for p in range(pos):
-            j = g.name2node[g.fw_post_order[p]]["index"]
+        for k in range(pos):
+            j = graph.name2node[graph.fw_post_order[k]]["index"]
             coeff[j] = 1
-        if g.nodes[i]["is_leaf"]:
-            continue
         prob += a[i] + lpDot(coeff, d) == TA_i + AG_i
 
     # [Constraint] Express the total amount of memory at each module
-    P_1 = g.nodes[0]["param_per_module"] / MEM_MULTIPLIER
+    P_1 = graph.nodes[0]["param_per_module"] / MEM_MULTIPLIER
     for i in range(num_nodes):
-        TG_i = g.nodes[i]["grad_total"] / MEM_MULTIPLIER
+        TG_i = graph.nodes[i]["grad_total"] / MEM_MULTIPLIER
         prob += m[i] - a[i] == P_1 + TG_i
 
     # [Constraint] Express peak memory
@@ -116,22 +114,22 @@ def sac_milp(
     # [Constraint] Ensure correctness of r_i
     for i in range(num_nodes):
         prob += y[i] >= r[i]
-        if g.nodes[i]["is_leaf"]:
+        if graph.nodes[i]["is_leaf"]:
             continue
-        ACM_i = g.nodes[i]["ac_memory"] / MEM_MULTIPLIER
-        IA_i = g.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
+        ACM_i = graph.nodes[i]["ac_memory"] / MEM_MULTIPLIER
+        IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += r[i] >= (ACM_i - IA_i) / ACM_i * y[i]
 
     # [Constraint] Express percentage of recomputation time
     for i in range(num_nodes):
-        for s in range(g.nodes[i]["n_segments"]):
-            slope = g.nodes[i]["slopes"][s]
-            intercept = g.nodes[i]["intercepts"][s]
+        for s in range(graph.nodes[i]["n_segments"]):
+            slope = graph.nodes[i]["slopes"][s]
+            intercept = graph.nodes[i]["intercepts"][s]
             prob += rcp[i] - slope * r[i] >= intercept
 
     # [Constraint] Express recomputation time rec_i = y_i * (rep_i * FCP_i)
     for i in range(num_nodes):
-        ACT_i = g.nodes[i]["ac_runtime"]
+        ACT_i = graph.nodes[i]["ac_runtime"]
         prob += rct[i] <= M * y[i]
         prob += rct[i] <= ACT_i * rcp[i]
         prob += rct[i] >= ACT_i * rcp[i] - M * (1 - y[i])
@@ -155,7 +153,7 @@ def sac_milp(
     ac_decisions = {}
     for i in range(num_nodes):
         if round(y[i].varValue) == 1:
-            ac_decisions[g.nodes[i]["fqn"]] = round(r[i].varValue, 4)
+            ac_decisions[graph.nodes[i]["fqn"]] = round(r[i].varValue, 4)
     logger.info(f"AC decisions are {json.dumps(ac_decisions, indent=2)}")
     logger.info(f"recomputation time is {round(value(prob.objective), 2)} ms")
     peak_mem = max_m.varValue * MEM_MULTIPLIER
@@ -164,7 +162,7 @@ def sac_milp(
     if verbose:
         logger.info("\n\n --------- DETAILS ---------")
         for i in range(num_nodes):
-            if g.nodes[i]["is_leaf"]:
+            if graph.nodes[i]["is_leaf"]:
                 continue
             y_i = y[i].varValue
             r_i = r[i].varValue
@@ -175,7 +173,7 @@ def sac_milp(
             rct_i = rct[i].varValue
             logger.info(
                 ("AC" if round(y_i) == 1 else "  ")
-                + f" {g.nodes[i]['fqn']:<40}: "
+                + f" {graph.nodes[i]['fqn']:<40}: "
                 + f"r_i = {r_i:.4f} "
                 + f"a_i = {display_bytes(a_i, 'GiB'):<10} "
                 + f"d_i = {display_bytes(d_i, 'GiB'):<10} "
