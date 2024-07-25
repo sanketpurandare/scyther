@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import time
+from typing import List
 
 import numpy as np
 from ilp_utils import display_bytes, Graph, parse_input
@@ -44,7 +45,11 @@ logger.addHandler(handler)
 
 
 def sac_milp(
-    g: Graph, memory_budget: int, solver: COIN_CMD, verbose: bool = False
+    g: Graph,
+    memory_budget: int,
+    solver: COIN_CMD,
+    ac_units: List[str] = None,
+    verbose: bool = False,
 ) -> None:
     """
     MILP to decide which modules to AC and how much memory to discard.
@@ -70,6 +75,13 @@ def sac_milp(
     max_m = LpVariable("max_m", 0)
 
     # Add constraints
+    # [Constraint] User specified AC units
+    if ac_units:
+        ac_units = set(ac_units)
+        for i in range(num_nodes):
+            if not graph.nodes[i]["fqn"] in ac_units:
+                prob += y[i] == 0
+
     # [Constraint] No nested AC units
     for i in range(num_nodes):
         for j in range(i + 1, num_nodes):
@@ -249,6 +261,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
 
+    parser.add_argument("--ac_units", "--names-list", nargs="+", default=[])
+
     args = parser.parse_args()
     return args
 
@@ -287,6 +301,7 @@ def main():
         graph,
         memory_budget=args.memory_budget,
         solver=solver,
+        ac_units=args.ac_units,
         verbose=args.verbose,
     )
 
