@@ -1,5 +1,5 @@
 import json
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 from aggregate_stats import ModStats
@@ -75,3 +75,20 @@ def display_bytes(b: int, unit: str = "B") -> str:
     if unit == "GiB":
         return f"{b/2**30:.2f} GiB"
     return f"{b:.2f} bytes"
+
+
+def get_peak_memory_runtime_no_ac_fsdp(graph: Graph) -> Tuple[int, float]:
+    """Get the peak memory without FSDP"""
+    P_1 = graph.nodes[0]["param_per_module"]
+    num_nodes = len(graph.nodes)
+    peak_mem = 0
+    for i in range(num_nodes):
+        TG_i = graph.nodes[i]["grad_total"]
+        AG_i = graph.nodes[i]["act_grad_per_module"]
+        TA_i = graph.nodes[i]["act_total"]
+        peak_mem = max(peak_mem, P_1 + TG_i + AG_i + TA_i)
+    compute_time = (
+        graph.nodes[0]["fw_runtime_per_module"]
+        + graph.nodes[0]["bw_runtime_per_module"]
+    )
+    return (peak_mem, compute_time)

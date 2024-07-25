@@ -20,7 +20,12 @@ import numpy as np
 from comm_analysis import NCCL_COLL
 from commtime_estimator import get_collective_latency_bandwidth
 
-from ilp_utils import display_bytes, Graph, parse_input
+from ilp_utils import (
+    display_bytes,
+    get_peak_memory_runtime_no_ac_fsdp,
+    Graph,
+    parse_input,
+)
 from pulp import (
     COIN_CMD,
     HiGHS_CMD,
@@ -302,19 +307,6 @@ def fsdp_milp(
             )
 
 
-def get_peak_memory_single_gpu(graph: Graph) -> int:
-    """Get the peak memory without FSDP"""
-    P_1 = graph.nodes[0]["param_per_module"]
-    num_nodes = len(graph.nodes)
-    peak_mem = 0
-    for i in range(num_nodes):
-        TG_i = graph.nodes[i]["grad_total"]
-        AG_i = graph.nodes[i]["act_grad_per_module"]
-        TA_i = graph.nodes[i]["act_total"]
-        peak_mem = max(peak_mem, P_1 + TG_i + AG_i + TA_i)
-    return peak_mem
-
-
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
 
@@ -419,10 +411,12 @@ def main():
             logger.error("HiGHS solver not found. Using CBC instead.")
 
     # get the memory utilization without fsdp
-    peak_mem = get_peak_memory_single_gpu(graph)
-    compute_time = (
-        graph.nodes[0]["fw_runtime_per_module"]
-        + graph.nodes[0]["bw_runtime_per_module"]
+    peak_mem, compute_time = get_peak_memory_runtime_no_ac_fsdp(graph)
+    logger.info(
+        "On a single GPU without AC \n"
+        + f"  peak memory is {display_bytes(peak_mem, 'GiB')}\n"
+        + f"  compute time is {round(compute_time, 2)} ms\n"
+        + "---" * 20
     )
     logger.info(
         "On a single GPU\n"
