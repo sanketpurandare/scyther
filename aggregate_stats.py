@@ -111,7 +111,7 @@ def aggregate_stats(
                 "fqn": mod_mem_stat.mod_fqn,
                 "param_per_module": mod_mem_stat.parameter_mem,
                 "grad_per_module": mod_mem_stat.parameter_mem,
-                "grad_total": mod_mem_stat.snapshots[_ModState.POST_BW][-1][dev][
+                "grad_total": mod_mem_stat.snapshots[_ModState.PRE_BW][-1][dev][
                     _MemRefType.GRAD
                 ],
                 "act_fw_per_module": max(
@@ -169,7 +169,7 @@ if __name__ == "__main__":
             model = GPT(config)
         optimizer = optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 2, 512
+        bsz, seq_len = 16, 512
         src = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
         inp = (src, tgt)
