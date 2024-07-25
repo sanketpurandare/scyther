@@ -15,7 +15,12 @@ import time
 from typing import List
 
 import numpy as np
-from ilp_utils import display_bytes, Graph, parse_input
+from ilp_utils import (
+    display_bytes,
+    get_peak_memory_runtime_no_ac_fsdp,
+    Graph,
+    parse_input,
+)
 from pulp import (
     COIN_CMD,
     HiGHS_CMD,
@@ -197,19 +202,6 @@ def sac_milp(
             )
 
 
-def get_peak_memory_no_ac(graph: Graph) -> int:
-    """Get the peak memory without FSDP"""
-    P_1 = graph.nodes[0]["param_per_module"]
-    num_nodes = len(graph.nodes)
-    peak_mem = 0
-    for i in range(num_nodes):
-        TG_i = graph.nodes[i]["grad_total"]
-        AG_i = graph.nodes[i]["act_grad_per_module"]
-        TA_i = graph.nodes[i]["act_total"]
-        peak_mem = max(peak_mem, P_1 + TG_i + AG_i + TA_i)
-    return peak_mem
-
-
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
 
@@ -275,11 +267,7 @@ def main():
     graph = parse_input(args.in_file)
 
     # get the memory utilization without ac
-    peak_mem = get_peak_memory_no_ac(graph)
-    compute_time = (
-        graph.nodes[0]["fw_runtime_per_module"]
-        + graph.nodes[0]["bw_runtime_per_module"]
-    )
+    peak_mem, compute_time = get_peak_memory_runtime_no_ac_fsdp(graph)
     logger.info(
         "On a single GPU without AC \n"
         + f"  peak memory is {display_bytes(peak_mem, 'GiB')}\n"
