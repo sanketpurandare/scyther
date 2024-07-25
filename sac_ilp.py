@@ -185,6 +185,19 @@ def sac_milp(
             )
 
 
+def get_peak_memory_no_ac(graph: Graph) -> int:
+    """Get the peak memory without FSDP"""
+    P_1 = graph.nodes[0]["param_per_module"]
+    num_nodes = len(graph.nodes)
+    peak_mem = 0
+    for i in range(num_nodes):
+        TG_i = graph.nodes[i]["grad_total"]
+        AG_i = graph.nodes[i]["act_grad_per_module"]
+        TA_i = graph.nodes[i]["act_total"]
+        peak_mem = max(peak_mem, P_1 + TG_i + AG_i + TA_i)
+    return peak_mem
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
 
@@ -245,7 +258,20 @@ def main():
     args = parse_args()
 
     # get the json file by running `python aggregate_stats.py`
-    g = parse_input(args.in_file)
+    graph = parse_input(args.in_file)
+
+    # get the memory utilization without ac
+    peak_mem = get_peak_memory_no_ac(graph)
+    compute_time = (
+        graph.nodes[0]["fw_runtime_per_module"]
+        + graph.nodes[0]["bw_runtime_per_module"]
+    )
+    logger.info(
+        "On a single GPU without AC \n"
+        + f"  peak memory is {display_bytes(peak_mem, 'GiB')}\n"
+        + f"  compute time is {round(compute_time, 2)} ms\n"
+        + "---" * 20
+    )
 
     # setup and solve the problem
     solver = PULP_CBC_CMD(msg=args.solver_msg)
@@ -258,7 +284,7 @@ def main():
         except Exception:
             logger.error("HiGHS solver not found. Using CBC instead.")
     sac_milp(
-        g,
+        graph,
         memory_budget=args.memory_budget,
         solver=solver,
         verbose=args.verbose,
