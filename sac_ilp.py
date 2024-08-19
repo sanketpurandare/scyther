@@ -19,6 +19,7 @@ from ilp_utils import (
     display_bytes,
     get_peak_memory_runtime_no_ac_fsdp,
     Graph,
+    is_submodule,
     parse_input,
 )
 from pulp import (
@@ -52,8 +53,10 @@ logger.addHandler(handler)
 def sac_milp(
     graph: Graph,
     memory_budget: int,
+    world_size: int,
     solver: COIN_CMD,
     ac_units: List[str] = None,
+    fsdp_units: List[str] = None,
     verbose: bool = False,
 ) -> None:
     """
@@ -70,13 +73,21 @@ def sac_milp(
     prob = LpProblem("SAC", LpMinimize)
 
     # Create decision variables
+    # y_i: indicator for if module i is AC'ed
     y = LpVariable.matrix("y", list(range(num_nodes)), 0, 1, LpInteger)
+    # r_i: percentage of discarded activation memory
     r = LpVariable.matrix("r", list(range(num_nodes)), 0, 1)
+    # d_i: discarded activation memory for module i
     d = LpVariable.matrix("d", list(range(num_nodes)), 0)
+    # a_i: total activation memory at module i
     a = LpVariable.matrix("a", list(range(num_nodes)), 0)
+    # m_i: memory at module i, combining parameters, gradients, and activations
     m = LpVariable.matrix("m", list(range(num_nodes)), 0)
+    # rcp_i: percentage of recomputation time
     rcp = LpVariable.matrix("rcp", list(range(num_nodes)), 0)
+    # rct_i: recomputation time for module i (in ms)
     rct = LpVariable.matrix("rct", list(range(num_nodes)), 0)
+    # max_m: peak memory
     max_m = LpVariable("max_m", 0)
 
     # Add constraints
@@ -85,6 +96,15 @@ def sac_milp(
         ac_units = set(ac_units)
         for i in range(num_nodes):
             if not graph.nodes[i]["fqn"] in ac_units:
+                prob += y[i] == 0
+
+    # [Constraint] User specified FSDP units
+    if fsdp_units:
+        for i in range(num_nodes):
+            if any(
+                is_submodule(fsdp_unit, graph.nodes[i]["fqn"])
+                for fsdp_unit in fsdp_units
+            ):
                 prob += y[i] == 0
 
     # [Constraint] No nested AC units
@@ -100,37 +120,20 @@ def sac_milp(
 
     # [Constraint] Express amount of discarded activation memory
     for i in range(num_nodes):
+        # There are two measures for activation memory: ACM and IA
+        # 1. IA is the activation memory saved when not using AC
+        # 2. ACM is the total activation memory, including those
+        #    that are not typically saved when not using AC
+        # Note: ACM >= IA
         ACM_i = graph.nodes[i]["ac_memory"] / MEM_MULTIPLIER
         IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += d[i] == ACM_i * r[i] - (ACM_i - IA_i) * y[i]
 
-    # [Constraint] Express total activation memory in the backward pass
-    for i in range(num_nodes):
-        AG_i = graph.nodes[i]["act_grad_per_module"] / MEM_MULTIPLIER
-        TA_i = graph.nodes[i]["act_total"] / MEM_MULTIPLIER
-        ACM_i = graph.nodes[i]["ac_memory"] / MEM_MULTIPLIER
-        IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
-        # related to discarded amount of memory
-        pos = graph.nodes[i]["pos_fw_post_order"]
-        coeff = np.zeros(num_nodes)
-        for p in range(pos):
-            j = graph.name2node[graph.fw_post_order[p]]["index"]
-            coeff[j] = 1
-        if graph.nodes[i]["is_leaf"]:
-            continue
-        prob += a[i] + lpDot(coeff, d) == TA_i + AG_i
-
-    # [Constraint] Express the total amount of memory at each module
-    P_1 = graph.nodes[0]["param_per_module"] / MEM_MULTIPLIER
-    for i in range(num_nodes):
-        TG_i = graph.nodes[i]["grad_total"] / MEM_MULTIPLIER
-        prob += m[i] - a[i] == P_1 + TG_i
-
-    # [Constraint] Express peak memory
-    for i in range(num_nodes):
-        prob += max_m >= m[i]
-
     # [Constraint] Ensure correctness of r_i
+    # There are two parts to its correctness
+    # 1. r_i > 0 only if y_i == 1 (discard only if it is an AC unit)
+    # 2. r_i needs to be large enough to cover the difference between
+    #    ACM and IA. Otherwise, we are not saving any memory
     for i in range(num_nodes):
         prob += y[i] >= r[i]
         if graph.nodes[i]["is_leaf"]:
@@ -139,14 +142,37 @@ def sac_milp(
         IA_i = graph.nodes[i]["act_fw_per_module"] / MEM_MULTIPLIER
         prob += r[i] >= (ACM_i - IA_i) / ACM_i * y[i]
 
+    # [Constraint] Express total activation memory in the backward pass
+    for i in range(num_nodes):
+        AG_i = graph.nodes[i]["act_grad_per_module"] / MEM_MULTIPLIER
+        TA_i = graph.nodes[i]["act_total"] / MEM_MULTIPLIER
+        # related to discarded amount of memory
+        pos = graph.nodes[i]["pos_fw_post_order"]
+        coeff = np.zeros(num_nodes)
+        for p in range(pos):
+            j = graph.name2node[graph.fw_post_order[p]]["index"]
+            coeff[j] = 1
+        prob += a[i] == TA_i + AG_i - lpDot(coeff, d)
+
+    # [Constraint] Express the total amount of memory at each module
+    P_1 = graph.nodes[0]["param_per_module"] / MEM_MULTIPLIER
+    for i in range(num_nodes):
+        TG_i = graph.nodes[i]["grad_total"] / MEM_MULTIPLIER
+        prob += m[i] == a[i] + (P_1 + TG_i) / world_size
+
+    # [Constraint] Express peak memory
+    for i in range(num_nodes):
+        prob += max_m >= m[i]
+
     # [Constraint] Express percentage of recomputation time
     for i in range(num_nodes):
         for s in range(graph.nodes[i]["n_segments"]):
             slope = graph.nodes[i]["slopes"][s]
             intercept = graph.nodes[i]["intercepts"][s]
-            prob += rcp[i] - slope * r[i] >= intercept
+            prob += rcp[i] >= slope * r[i] + intercept
 
-    # [Constraint] Express recomputation time rec_i = y_i * (rep_i * FCP_i)
+    # [Constraint] Express recomputation time
+    # rct_i = (rcp_i * ACT_i) if y_i == 1 else 0
     for i in range(num_nodes):
         ACT_i = graph.nodes[i]["ac_runtime"]
         prob += rct[i] <= M * y[i]
@@ -248,12 +274,21 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--world_size",
+        required=False,
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
         "--solver_msg",
         help="Turn on/off solver messages",
         action="store_true",
     )
 
-    parser.add_argument("--ac_units", "--names-list", nargs="+", default=[])
+    parser.add_argument("--ac_units", nargs="+", default=[])
+
+    parser.add_argument("--fsdp_units", nargs="+", default=[])
 
     args = parser.parse_args()
     return args
@@ -288,8 +323,10 @@ def main():
     sac_milp(
         graph,
         memory_budget=args.memory_budget,
+        world_size=args.world_size,
         solver=solver,
         ac_units=args.ac_units,
+        fsdp_units=args.fsdp_units,
         verbose=args.verbose,
     )
 

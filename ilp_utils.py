@@ -48,12 +48,6 @@ def parse_input(filename: str) -> Graph:
         g.add_node(node)
 
     # set up ancestor-descendant matrix
-    def is_self_or_submodule(name_descendant: str, name_ancestor: str) -> bool:
-        # if name_descendant is a submodule of name_ancestor, or if they are the same
-        return (
-            name_descendant == name_ancestor or name_ancestor + "." in name_descendant
-        )
-
     for i in range(n_nodes):
         for j in range(i, n_nodes):
             if is_self_or_submodule(g.nodes[j]["fqn"], g.nodes[i]["fqn"]):
@@ -62,6 +56,16 @@ def parse_input(filename: str) -> Graph:
                 break
 
     return g
+
+
+def is_self_or_submodule(name_descendant: str, name_ancestor: str) -> bool:
+    # if name_descendant is a submodule of name_ancestor, or if they are the same
+    return name_descendant == name_ancestor or name_ancestor + "." in name_descendant
+
+
+def is_submodule(name_descendant: str, name_ancestor: str) -> bool:
+    # if name_descendant is a submodule of name_ancestor, but not the same
+    return name_ancestor + "." in name_descendant
 
 
 def display_bytes(b: int, unit: str = "B") -> str:
