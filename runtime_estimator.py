@@ -1,7 +1,6 @@
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Set, Tuple, Type
-from typing_extensions import Self
+from typing import Any, Callable, Dict, List, Set
 
 import torch
 import torch.utils._pytree as pytree
@@ -12,6 +11,7 @@ from torch.distributed._tools.mod_tracker import ModTracker
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
+from typing_extensions import Self
 
 aten = torch.ops.aten
 
@@ -69,10 +69,11 @@ __all__ = ["RuntimeEstimator"]
 
 class RuntimeEstimator(TorchDispatchMode):
     """
-    Estimates the GPU runtime using various estimation methods under the ``FakeTensorMode``.
+    Estimates the GPU runtime in milliseconds using various estimation methods under the ``FakeTensorMode``.
 
     This class provides a ``TorchDispatchMode`` based context manager that can be used to estimate the eager
-    runtime of PyTorch functions. It supports two estimation modes, benchmarking and roofline cost modeling.
+    runtime of PyTorch functions. It supports two estimation modes, benchmarking (`operator-level-benchmark`) and
+    roofline cost modeling (`operator-level-cost-model`).
     For modules executed under this context manager, it agggregates the forward and backward operation runtimes
     and also records their execution orders.
 
@@ -85,7 +86,32 @@ class RuntimeEstimator(TorchDispatchMode):
         mod_fw_post_order (List[str]): List of module FQNs in post-forward execution order.
         mod_bw_post_order (List[str]): List of module FQNs in post-backward execution order.
         total_runtime (float): The total estimated runtime in milliseconds.
+
+    Note:
+        1) The benchmarking estimate mode will execute kernels on GPU and assumes that every operation can run in
+            isolation with causing an OOM. It is also designed to be used under ``FakeTensorMode``.
+        2) Currently wrapper tensor sub-classes such as ``DTensor`` won't produce correct estimates. We plan to support
+            them in future PRs.
+        3) We only estimate the compute time, if your code has communication, it will not be considered. Again, we will
+            support this in future PRs.
+
+    Example usage:
+
+        .. code-block:: python
+
+            runtime_estimator = RuntimeEstimator()
+            with FakeTensorMode():
+                module = ...
+                optimizer = ...
+                inp = ...
+                with runtime_estimator(estimate_mode_type="operator-level-cost-model"):
+                    loss = module(inp)
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                runtime_estimator.display_modulewise_stats()
     """
+
     _gpu_memory_bandwidth = get_gpu_dram_gbps()
     _float_types: Set[torch.dtype] = {
         torch.float16,
@@ -161,9 +187,13 @@ class RuntimeEstimator(TorchDispatchMode):
             args, kwargs = pytree.tree_unflatten(flat_args, args_spec)
             r = func(*args, **kwargs)
             num_iters = 5
-            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-            cpu_start = time.time()           
+            start_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(num_iters)
+            ]
+            end_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(num_iters)
+            ]
+            cpu_start = time.time()
             for i in range(num_iters):
                 start_events[i].record(torch.cuda.current_stream())
                 func(*args, **kwargs)
@@ -171,7 +201,12 @@ class RuntimeEstimator(TorchDispatchMode):
             cpu_end = time.time()
             torch.cuda.synchronize()
             cpu_time = (cpu_end - cpu_start) / 1000
-            total_op_time = sum((start_events[i].elapsed_time(end_events[i]) for i in range(2, num_iters)))
+            total_op_time = sum(
+                (
+                    start_events[i].elapsed_time(end_events[i])
+                    for i in range(2, num_iters)
+                )
+            )
             mean_op_time = (total_op_time - cpu_time) / num_iters
 
         storages = set()
@@ -252,6 +287,7 @@ class RuntimeEstimator(TorchDispatchMode):
         Returns:
             float: The estimated runtime of the function in seconds.
         """
+
         def get_num_bytes(t: torch.Tensor) -> int:
             st = t.untyped_storage()
             num_bytes = st.size() * st.element_size()
