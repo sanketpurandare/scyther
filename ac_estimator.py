@@ -277,7 +277,7 @@ class SACEstimator(TorchDispatchMode):
         kwargs = {} if kwargs is None else kwargs
         out = func(*args, **kwargs or {})
         # 1. Get the runtime estimate
-        op_time = RuntimeEstimator._inductor_estimate(func, args, kwargs, out)
+        op_time = RuntimeEstimator._roofline_estimate(func, args, kwargs, out)
         flat_outs, _ = tree_flatten(out)
         out_storages: Set[UntypedStorage] = set()
         devices: Set[torch.device] = set()

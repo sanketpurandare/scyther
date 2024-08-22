@@ -1,6 +1,7 @@
 import time
 from collections import defaultdict
-from typing import Callable, Dict, Set
+from typing import Any, Callable, Dict, List, Set, Tuple, Type
+from typing_extensions import Self
 
 import torch
 import torch.utils._pytree as pytree
@@ -15,7 +16,7 @@ from torch.utils.flop_counter import flop_registry
 aten = torch.ops.aten
 
 # No fall-back kernel needed/exists for view ops
-_IGNORE_OPS = {
+_VIEW_OPS = {
     aten.lift_fresh,
     aten.t,
     aten.transpose,
@@ -61,12 +62,30 @@ _CREATE_OPS = {
     aten.zeros_like,
 }
 
-_IGNORE_OPS_EXT = _IGNORE_OPS | _CREATE_OPS
+_IGNORE_OPS = _VIEW_OPS | _CREATE_OPS
 
 __all__ = ["RuntimeEstimator"]
 
 
 class RuntimeEstimator(TorchDispatchMode):
+    """
+    Estimates the GPU runtime using various estimation methods under the ``FakeTensorMode``.
+
+    This class provides a ``TorchDispatchMode`` based context manager that can be used to estimate the eager
+    runtime of PyTorch functions. It supports two estimation modes, benchmarking and roofline cost modeling.
+    For modules executed under this context manager, it agggregates the forward and backward operation runtimes
+    and also records their execution orders.
+
+    Attributes:
+        mod_runtimes (Dict[str, Dict[str, float]]): A dictionary of module runtimes. The key to the outer dictionary
+            is the fully qualified name (FQN) of the module. For each module the forward and backward runtimes of the
+            operations are aggregated in the inner dictionary keyed by 'fw' and 'bw'.
+        mod_fw_pre_order (List[str]): List of module FQNs in pre-forward execution order.
+        mod_bw_pre_order (List[str]): List of module FQNs in pre-backward execution order.
+        mod_fw_post_order (List[str]): List of module FQNs in post-forward execution order.
+        mod_bw_post_order (List[str]): List of module FQNs in post-backward execution order.
+        total_runtime (float): The total estimated runtime in milliseconds.
+    """
     _gpu_memory_bandwidth = get_gpu_dram_gbps()
     _float_types: Set[torch.dtype] = {
         torch.float16,
@@ -74,36 +93,50 @@ class RuntimeEstimator(TorchDispatchMode):
         torch.float32,
         torch.float64,
     }
-    _no_fallback_kernel = set()
+    _no_fallback_kernel: Set[torch._ops._OpNamespace] = set()
     fake_mode: FakeTensorMode
 
-    def __init__(self):
+    def __init__(self) -> None:
+        super().__init__()
         self._estimate: Callable
         self._estimate_mode_type: str
         self._mod_tracker = ModTracker()
         self.mod_runtimes: Dict[str, Dict[str, float]] = defaultdict(
             lambda: defaultdict(lambda: 0.0)
         )
-        self.mod_fw_pre_order = []
-        self.mod_bw_pre_order = []
-        self.mod_fw_post_order = []
-        self.mod_bw_post_order = []
+        self.mod_fw_pre_order: List[str] = []
+        self.mod_bw_pre_order: List[str] = []
+        self.mod_fw_post_order: List[str] = []
+        self.mod_bw_post_order: List[str] = []
         self.total_runtime: float = 0.0
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_subclasses/fake_tensor.py#L1969  # noqa
     # NB: returns fake tensors
     @classmethod
-    def _maybe_run_and_benchmark_fallback_kernel(
+    def _maybe_run_and_benchmark_fallback_kernel(  # type: ignore[no-untyped-def]
         cls,
         func,
         args,
         kwargs,
         orig_not_implemented_exception,
     ):
+        """
+        Runs and benchmarks a fallback kernel for a given function.
+
+        Args:
+            func (Callable): The function to benchmark.
+            args (Tuple): The arguments to pass to the function.
+            kwargs (Dict[str, Any]): The keyword arguments to pass to the function.
+            orig_not_implemented_exception (Exception): The original exception to raise if the fallback kernel
+                is not implemented.
+
+        Returns:
+            Tuple[Any, float]: A tuple containing the result of the function and the mean operation time.
+        """
         # these should all be supported, just to be safe
         # avoid fallback for operators which inplace modify metadata
         # because the input fake tensors would be umodified
-        if torch.Tag.inplace_view in func.tags:
+        if torch.Tag.inplace_view in func.tags:  # type: ignore[attr-defined]
             raise orig_not_implemented_exception
 
         inp_impls = {}
@@ -127,20 +160,19 @@ class RuntimeEstimator(TorchDispatchMode):
             flat_args = [to_real_tensor(a) for a in flat_args]
             args, kwargs = pytree.tree_unflatten(flat_args, args_spec)
             r = func(*args, **kwargs)
-            num_iters = 3
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            cpu_start = time.time()
-            start_event.record(torch.cuda.current_stream())
-            for _ in range(num_iters):
-                r = None
-                r = func(*args, **kwargs)
-            end_event.record(torch.cuda.current_stream())
+            num_iters = 5
+            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+            cpu_start = time.time()           
+            for i in range(num_iters):
+                start_events[i].record(torch.cuda.current_stream())
+                func(*args, **kwargs)
+                end_events[i].record(torch.cuda.current_stream())
             cpu_end = time.time()
             torch.cuda.synchronize()
             cpu_time = (cpu_end - cpu_start) / 1000
-            total_op_time = start_event.elapsed_time(end_event) - cpu_time
-            mean_op_time = total_op_time / num_iters
+            total_op_time = sum((start_events[i].elapsed_time(end_events[i]) for i in range(2, num_iters)))
+            mean_op_time = (total_op_time - cpu_time) / num_iters
 
         storages = set()
 
@@ -175,12 +207,24 @@ class RuntimeEstimator(TorchDispatchMode):
         return (pytree.tree_map(map_out, r), mean_op_time)
 
     @classmethod
-    def _benchmark_estimate(cls, func, args, kwargs, res) -> float:
+    def _benchmark_estimate(cls, func, args, kwargs, res) -> float:  # type: ignore[no-untyped-def]
+        """
+        Estimates the runtime of a function using benchmarking.
+
+        Args:
+            func: The function to estimate.
+            args: The arguments to pass to the function.
+            kwargs: The keyword arguments to pass to the function.
+            res: The result of the function.
+
+        Returns:
+            float: The estimated runtime of the function in seconds.
+        """
         assert isinstance(
             cls.fake_mode, FakeTensorMode
         ), "Initialize/Assign FakeTensorMode before using this function"
         mean_op_time = 0.0
-        if func._overloadpacket not in _IGNORE_OPS_EXT:
+        if func._overloadpacket not in _IGNORE_OPS:
             try:
                 res, mean_op_time = cls._maybe_run_and_benchmark_fallback_kernel(
                     func,
@@ -195,7 +239,19 @@ class RuntimeEstimator(TorchDispatchMode):
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589  # noqa
     @classmethod
-    def _inductor_estimate(cls, func, args, kwargs, out) -> float:
+    def _roofline_estimate(cls, func, args, kwargs, out) -> float:  # type: ignore[no-untyped-def]
+        """
+        Estimates the runtime of a function using a roofline cost model.
+
+        Args:
+            func: The function to estimate.
+            args: The arguments to pass to the function.
+            kwargs: The keyword arguments to pass to the function.
+            out: The output of the function.
+
+        Returns:
+            float: The estimated runtime of the function in seconds.
+        """
         def get_num_bytes(t: torch.Tensor) -> int:
             st = t.untyped_storage()
             num_bytes = st.size() * st.element_size()
@@ -205,8 +261,7 @@ class RuntimeEstimator(TorchDispatchMode):
             if func_packet in flop_registry:
                 assert (
                     len(out_dtypes) == 1
-                ), f"Only support single out dtype got {out_dtypes}"
-                f"{out_dtypes} for {func_packet}"
+                ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
                 dtype = out_dtypes.pop()
                 # We can expect to achieve 75% of theoretical peak flops
                 factor = 0.75
@@ -239,7 +294,7 @@ class RuntimeEstimator(TorchDispatchMode):
 
         op_time = 0.0
         func_packet = func._overloadpacket
-        if func_packet not in _IGNORE_OPS:
+        if func_packet not in _VIEW_OPS:
 
             flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
             flat_outs, out_spec = pytree.tree_flatten(out)
@@ -262,6 +317,15 @@ class RuntimeEstimator(TorchDispatchMode):
         return op_time
 
     def display_modulewise_stats(self, depth: int = 2):
+        """
+        Displays module-wise statistics collected by ``RuntimeEstimator``.
+
+        Prints the pre-forward and pre-backward execution orders.
+        Displays the module-wise forward and backward runtimes in milliseconds.
+
+        Args:
+            depth (int): The maximum depth of module hierarchy to display (default to 2).
+        """
         print("Pre-Forward Execution Order: ")
         for mod_fqn in self.mod_fw_pre_order:
             mod_depth = mod_fqn.count(".") + 1
@@ -282,9 +346,9 @@ class RuntimeEstimator(TorchDispatchMode):
                 f"{mod_fqn} fw: {runtimes.get('fw', 0.0):.3f}ms bw: {runtimes.get('bw', 0.0):.3f}ms"
             )
 
-    def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+    def __torch_dispatch__(self, func, types, args=..., kwargs=None):  # type: ignore[no-untyped-def]
         res = func(*args, **kwargs or {})
-        # FIXME @sanketpurandare: faltten tensors by desugaring the tensor subclasses
+        # FIXME: @sanketpurandare: flatten tensors by desugaring the tensor subclasses
         op_time = self._estimate(func, args, kwargs, res)
         for par in self._mod_tracker.parents:
             if self._mod_tracker.is_bw:
@@ -294,11 +358,27 @@ class RuntimeEstimator(TorchDispatchMode):
         self.total_runtime += op_time
         return res
 
-    def __call__(self, estimate_mode_type: str):
+    def __call__(self, estimate_mode_type: str) -> Self:
+        """
+        Sets the estimate mode type.
+
+        Currently supported modes:
+            - "operator-level-benchmark": Estimates runtime using operator benchmarking.
+            - "operator-level-cost-model": Estimates runtime using roofline cost model.
+
+        Args:
+            estimate_mode_type (str): The type of estimate mode to use.
+
+        Returns:
+            RuntimeEstimator: The runtime estimator instance.
+
+        Raises:
+            NotImplementedError: If the estimate mode type is not supported.
+        """
         if estimate_mode_type == "operator-level-benchmark":
             self._estimate = RuntimeEstimator._benchmark_estimate
         elif estimate_mode_type == "operator-level-cost-model":
-            self._estimate = RuntimeEstimator._inductor_estimate
+            self._estimate = RuntimeEstimator._roofline_estimate
         else:
             raise NotImplementedError(
                 f"estimate_mode_type {estimate_mode_type} not supported"
@@ -306,7 +386,7 @@ class RuntimeEstimator(TorchDispatchMode):
         self._estimate_mode_type = estimate_mode_type
         return self
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         fake_mode = active_fake_mode()
         assert isinstance(
             fake_mode, FakeTensorMode
@@ -336,7 +416,7 @@ class RuntimeEstimator(TorchDispatchMode):
         super().__enter__()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         print(
             f"Estimated ({self._estimate_mode_type})"
             f"total_time: {self.total_runtime:.3f} ms"
