@@ -2,7 +2,7 @@ import copy
 from typing import Callable, Tuple
 
 import torch
-from runtime_estimator import RuntimeEstimator
+from torch.distributed._tools.runtime_estimator import RuntimeEstimator
 from test_model import GPT, GPTConfig, loss_fn
 from torch import nn, optim
 from torch._subclasses.fake_tensor import FakeTensorMode
